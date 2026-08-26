@@ -27,6 +27,11 @@ internal sealed class ControllerSession : IDisposable
     private const int HapticsFramesPerPacket = 240;
     private static readonly TimeSpan StateCoalesceWindow = TimeSpan.FromMilliseconds(4);
 
+    // Repeats and refreshes are owed on a deadline, and a game that has written
+    // its last output report leaves nothing to carry them. The tick reads three
+    // deadlines and almost always emits nothing; it never rebuilds feedback.
+    private static readonly TimeSpan OutputRefreshInterval = TimeSpan.FromMilliseconds(250);
+
     private readonly object _stateLock = new();
     private readonly object _outputLock = new();
     private readonly HMController _controller;
@@ -34,8 +39,11 @@ internal sealed class ControllerSession : IDisposable
     private readonly HMAudioOutput? _audioOutput;
     private readonly Action<Protocol.Message> _emit;
     private readonly System.Threading.Timer _stateSubmitTimer;
+    private readonly System.Threading.Timer _outputRefreshTimer;
     private DefaultAudioEndpointGuard? _audioEndpointGuard;
     private readonly AdaptiveTriggerState _adaptiveTriggers = new();
+    private readonly LightbarState _lightbar = new();
+    private readonly RumbleState _rumble = new();
     private readonly ControllerStateSubmissionPolicy _submissionPolicy = new();
     private HMGamepadState _state;
     private readonly Dictionary<uint, int> _touchSlots = new();
@@ -85,6 +93,11 @@ internal sealed class ControllerSession : IDisposable
             null,
             Timeout.InfiniteTimeSpan,
             Timeout.InfiniteTimeSpan);
+        _outputRefreshTimer = new System.Threading.Timer(
+            _ => FlushPendingOutput(),
+            null,
+            OutputRefreshInterval,
+            OutputRefreshInterval);
     }
 
     internal byte DeviceId { get; }
@@ -308,6 +321,37 @@ internal sealed class ControllerSession : IDisposable
         }
     }
 
+    private void FlushPendingOutput()
+    {
+        try
+        {
+            lock (_outputLock)
+            {
+                // Checked under the lock Dispose takes to reset the triggers,
+                // so a refresh cannot land after that reset has gone out.
+                if (Volatile.Read(ref _disposed) != 0)
+                    return;
+                var now = _clock.Elapsed;
+                if (_rumble.TryRefresh(now, DeviceId, ClientControllerNumber, out var rumble))
+                    _emit(rumble);
+                if (_adaptiveTriggers.TryRefresh(now, DeviceId, ClientControllerNumber, out var adaptiveTriggers))
+                    _emit(adaptiveTriggers);
+                if (_lightbar.TryRefresh(now, DeviceId, ClientControllerNumber, out var led))
+                    _emit(led);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (Interlocked.Exchange(ref _asyncSubmitFailureReported, 1) == 0)
+            {
+                _emit(new Protocol.Message(
+                    Protocol.MessageType.Error,
+                    0,
+                    Protocol.ErrorPayload(-1, $"Unable to refresh DualSense output feedback: {ex.Message}")));
+            }
+        }
+    }
+
     private void SubmitPendingStateLocked()
     {
         if (!_stateDirty)
@@ -326,27 +370,25 @@ internal sealed class ControllerSession : IDisposable
             if (Volatile.Read(ref _disposed) != 0)
                 return;
 
+            // Fields are read as the hardware reads them, and only differences
+            // reach the wire: the client replays every forwarded packet as a
+            // write to the player's physical controller.
+            var now = _clock.Elapsed;
+            var valid = OutputValidFlags.From(output.Fields);
+            // The motor bytes are the one field still read at face value; see
+            // OutputValidFlags for why.
             if (TryByte(output.Fields, "leftMotor", out var left) &&
-                TryByte(output.Fields, "rightMotor", out var right))
+                TryByte(output.Fields, "rightMotor", out var right) &&
+                _rumble.TryUpdate(left, right, now, DeviceId, ClientControllerNumber, out var rumble))
             {
-                var payload = new byte[6];
-                payload[0] = DeviceId;
-                payload[1] = ClientControllerNumber;
-                BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(2, 2), (ushort)(left * 257));
-                BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(4, 2), (ushort)(right * 257));
-                _emit(new Protocol.Message(Protocol.MessageType.Rumble, 0, payload));
+                _emit(rumble);
             }
 
-            if (_adaptiveTriggers.TryUpdate(output.Fields, DeviceId, ClientControllerNumber, out var adaptiveTriggers))
+            if (_adaptiveTriggers.TryUpdate(output.Fields, valid, now, DeviceId, ClientControllerNumber, out var adaptiveTriggers))
                 _emit(adaptiveTriggers);
 
-            if (output.Fields.TryGetValue("lightbar", out var value) && value is byte[] rgb && rgb.Length >= 3)
-            {
-                _emit(new Protocol.Message(
-                    Protocol.MessageType.Led,
-                    0,
-                    new[] { DeviceId, ClientControllerNumber, rgb[0], rgb[1], rgb[2] }));
-            }
+            if (_lightbar.TryUpdate(output.Fields, valid, now, DeviceId, ClientControllerNumber, out var led))
+                _emit(led);
         }
     }
 
@@ -532,6 +574,8 @@ internal sealed class ControllerSession : IDisposable
             _stateDirty = false;
             _stateFlushScheduled = false;
         }
+        _outputRefreshTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        _outputRefreshTimer.Dispose();
         _audioEndpointGuard?.Dispose();
         _audioEndpointGuard = null;
         _controller.OutputDecoded -= OnOutputDecoded;
