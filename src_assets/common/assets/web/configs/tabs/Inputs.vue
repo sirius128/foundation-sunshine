@@ -146,6 +146,20 @@ onBeforeUnmount(() => {
 
 <template>
   <div id="input" class="config-page">
+    <div class="mb-3" v-if="platform === 'windows'">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="usb_forwarding_enabled"
+               v-model="config.usb_forwarding_enabled" true-value="enabled" false-value="disabled">
+        <label class="form-check-label" for="usb_forwarding_enabled">{{ $t('config.usb_forwarding_enabled') }}</label>
+      </div>
+      <div class="form-text">{{ $t('config.usb_forwarding_description') }}</div>
+      <div v-if="config.usb_forwarding_enabled === 'enabled'" class="mt-2">
+        <label for="usb_forwarding_port" class="form-label">{{ $t('config.usb_forwarding_port') }}</label>
+        <input id="usb_forwarding_port" type="number" :min="Number(config.usb_forwarding_port) === 0 ? 0 : 1024" max="65535"
+               class="form-control" v-model.number="config.usb_forwarding_port">
+        <div class="form-text">{{ $t('config.usb_forwarding_port_hint') }}</div>
+      </div>
+    </div>
     <!-- Enable Gamepad Input -->
     <div class="mb-3">
       <div class="form-check form-switch">
@@ -172,12 +186,21 @@ onBeforeUnmount(() => {
           </template>
           
           <template #windows>
+            <option value="ds5">{{ $t('config.gamepad_ds5') }}</option>
             <option value="ds4">{{ $t('config.gamepad_ds4') }}</option>
             <option value="x360">{{ $t('config.gamepad_x360') }}</option>
           </template>
         </PlatformLayout>
       </select>
       <div class="form-text">{{ $t('config.gamepad_desc') }}</div>
+      <div
+        v-if="platform === 'windows' && config.gamepad === 'ds5'"
+        class="alert alert-warning mt-2 mb-0"
+        role="note"
+      >
+        <i class="fas fa-info-circle me-2" aria-hidden="true"></i>
+        {{ $t('config.gamepad_ds5_component_hint_windows') }}
+      </div>
     </div>
 
     <div class="accordion mb-3" v-if="config.gamepad === 'ds4'">

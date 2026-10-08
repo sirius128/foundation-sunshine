@@ -26,10 +26,32 @@ namespace input {
   probe_gamepads();
 
   std::shared_ptr<input_t>
-  alloc(safe::mail_t mail);
+  alloc(safe::mail_t mail, std::uint64_t session_id, std::string client_gamepad);
+
+  /**
+   * @brief 检查当前会话是否已成功分配 DualSense。
+   * @param input 会话输入上下文。
+   * @return 至少一个 DualSense 手柄分配成功时返回 true。
+   */
+  bool
+  has_ds5_gamepad(const std::shared_ptr<input_t> &input);
+
+  /**
+   * @brief 检查当前会话的 DualSense 音频触觉是否仍可用。
+   * @param input 会话输入上下文。
+   * @return 已协商音频触觉且未降级或断线时返回 true。
+   */
+  bool
+  has_ds5_audio_haptics(const std::shared_ptr<input_t> &input);
 
   struct touch_port_t: public platf::touch_port_t {
     int env_width, env_height;
+
+    // Physical size of the selected display in desktop pixels. UIA and caret
+    // rectangles are reported in this coordinate frame, so remote text context
+    // capture geometry must use these extents, not width/height (stream
+    // resolution) or env_* (whole virtual desktop).
+    int display_width, display_height;
 
     // Offset x and y coordinates of the client
     float client_offsetX, client_offsetY;
@@ -38,7 +60,8 @@ namespace input {
 
     explicit
     operator bool() const {
-      return width != 0 && height != 0 && env_width != 0 && env_height != 0;
+      return width != 0 && height != 0 && env_width != 0 && env_height != 0 &&
+             display_width != 0 && display_height != 0;
     }
   };
 
@@ -51,4 +74,30 @@ namespace input {
    */
   std::pair<float, float>
   scale_client_contact_area(const std::pair<float, float> &val, uint16_t rotation, const std::pair<float, float> &scalar);
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    struct keyboard_event_t {
+      std::uint16_t key_code;
+      bool release;
+      std::uint8_t flags;
+    };
+
+    std::shared_ptr<input_t>
+    make_input();
+
+    void
+    set_keyboard_sink(std::function<void(const keyboard_event_t &)> sink);
+
+    void
+    send_keyboard_packet(std::shared_ptr<input_t> &input, std::uint16_t key_code,
+                         std::uint8_t modifiers, std::uint8_t flags, bool release);
+
+    void
+    release_held_keys();
+
+    void
+    reset_keyboard_state();
+  }  // namespace testing
+#endif
 }  // namespace input

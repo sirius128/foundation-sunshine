@@ -203,7 +203,9 @@ print_raw_digitizer_count(const char *tag) {
       UINT nsize = sizeof(name);
       GetRawInputDeviceInfoW(d.hDevice, RIDI_DEVICENAME, name, &nsize);
       printf("[raw] %s: digitizer vid=0x%04X pid=0x%04X usage=0x%02X path=%ls\n", tag,
-             info.hid.dwVendorId, info.hid.dwProductId, info.hid.usUsage, name);
+             static_cast<unsigned int>(info.hid.dwVendorId),
+             static_cast<unsigned int>(info.hid.dwProductId),
+             static_cast<unsigned int>(info.hid.usUsage), name);
     }
   }
   printf("[raw] %s: %d digitizer(s) total\n", tag, digitizers);
@@ -247,7 +249,7 @@ host_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     POINTER_INFO pi {};
     if (GetPointerInfo(pid, &pi)) {
       printf("[ptr] msg=0x%03X id=%u type=%u flags=0x%X at (%ld,%ld)\n",
-             m, pid, pi.pointerType, pi.pointerFlags,
+             m, pid, static_cast<unsigned int>(pi.pointerType), pi.pointerFlags,
              (long) pi.ptPixelLocation.x, (long) pi.ptPixelLocation.y);
     }
     else {
@@ -309,7 +311,12 @@ StealForeground() {
 }
 
 static int
-run_auto(remote_usb::virtual_touchscreen_device &dev, int screen_w, int screen_h) {
+run_auto(remote_usb::virtual_touchscreen_device &dev, int hid_w, int hid_h) {
+  // Source domain: physical screen pixels (GetWindowRect / SetCursorPos are
+  // physical in a per-monitor-v2 aware process).  Target domain: the HID
+  // digitizer's declared logical range.
+  const int screen_w = GetSystemMetrics(SM_CXSCREEN);
+  const int screen_h = GetSystemMetrics(SM_CYSCREEN);
   WNDCLASSW wc = {};
   wc.lpfnWndProc = host_proc;
   wc.lpszClassName = L"VtouchPocHost";
@@ -370,8 +377,8 @@ run_auto(remote_usb::virtual_touchscreen_device &dev, int screen_w, int screen_h
   auto to_digitizer = [&](int px, int py) {
     dev.update_contacts({ remote_usb::touchscreen_contact {
       1,
-      (std::uint16_t) ((std::int64_t) px * 1920 / screen_w),
-      (std::uint16_t) ((std::int64_t) py * 1080 / screen_h),
+      (std::uint16_t) ((std::int64_t) px * hid_w / screen_w),
+      (std::uint16_t) ((std::int64_t) py * hid_h / screen_h),
       100, true, true } });
   };
   // Three tap attempts; each checks whether the edit gains keyboard focus.
@@ -579,6 +586,9 @@ wmain(int argc, wchar_t **argv) {
                   L"| Format-List FriendlyName,Status,Class,InstanceId | Out-String -Width 200\"")
            .c_str());
 
+  // Digitizer logical range == the descriptor's declared size.  With DPI
+  // awareness on, GetSystemMetrics would return physical pixels of the whole
+  // monitor, which is NOT the digitizer's coordinate basis.
   const int screen_w = GetSystemMetrics(SM_CXSCREEN);
   const int screen_h = GetSystemMetrics(SM_CYSCREEN);
 
@@ -659,7 +669,7 @@ wmain(int argc, wchar_t **argv) {
   }
 
   if (auto_mode) {
-    int rc = run_auto(dev, screen_w, screen_h);
+    int rc = run_auto(dev, cfg.width_px, cfg.height_px);
     pump_sleep(3000);
     bridge.stop();
     return rc;

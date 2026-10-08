@@ -8,10 +8,12 @@
 // standard includes
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
@@ -46,6 +48,8 @@
 #include "file_mapping/service.h"
 #include "globals.h"
 #include "hdr/session_target.h"
+#include "image_enhancement/nr_defaults.h"
+#include "http_util.h"
 #include "httpcommon.h"
 #include "logging.h"
 #include "network.h"
@@ -65,8 +69,7 @@
 #include "platform/common.h"
 #include "platform/run_command.h"
 #include "process.h"
-#include "remote_usb/remote_usb_http.h"
-#include "remote_usb/remote_usb_service.h"
+#include "remote_usb/reverse_tunnel_service.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "tray/system_tray.h"
@@ -90,8 +93,6 @@ namespace nvhttp {
   };
 
   boost::atomic<uint32_t> session_id_counter {0};
-  static boost::atomic_flag global_cancel_pending = BOOST_ATOMIC_FLAG_INIT;
-
   static tls_client_identity_store_t tls_client_identities;
 
   template <class Request>
@@ -218,203 +219,6 @@ namespace nvhttp {
   using resp_http_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response>;
   using req_http_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Request>;
 
-  namespace {
-
-    bool
-    remote_usb_valid_port(std::string_view value) noexcept {
-      if (value.empty() || value.size() > 5) {
-        return false;
-      }
-      std::uint32_t port = 0;
-      const auto result = std::from_chars(value.data(), value.data() + value.size(), port, 10);
-      return result.ec == std::errc {} && result.ptr == value.data() + value.size() &&
-             port != 0 && port <= 65535;
-    }
-
-    bool
-    remote_usb_valid_reg_name(std::string_view value) noexcept {
-      /* Keep the accepted set deliberately narrower than RFC 3986's reg-name:
-       * it covers DNS, mDNS and ordinary host aliases while excluding userinfo,
-       * percent escapes, path separators and other ambiguous authority syntax. */
-      if (value.empty() || value.size() > 253 || value.front() == '.' ||
-          value.front() == '-') {
-        return false;
-      }
-      /* A single trailing dot is the canonical fully-qualified DNS spelling. */
-      if (value.back() == '.') {
-        value.remove_suffix(1);
-      }
-      if (value.empty() || value.back() == '-') {
-        return false;
-      }
-      std::size_t label_start = 0;
-      for (std::size_t index = 0; index <= value.size(); ++index) {
-        if (index == value.size() || value[index] == '.') {
-          if (index == label_start) {
-            return false;
-          }
-          const auto label_size = index - label_start;
-          if (label_size > 63 || value[label_start] == '-' ||
-              value[index - 1] == '-') {
-            return false;
-          }
-          label_start = index + 1;
-          continue;
-        }
-        const auto byte = static_cast<unsigned char>(value[index]);
-        if (!(std::isalnum(byte) || byte == '-' || byte == '_')) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    bool
-    remote_usb_unspecified_literal(std::string_view host) noexcept {
-      boost::system::error_code error;
-      const auto address = boost::asio::ip::make_address(host, error);
-      return !error && address.is_unspecified();
-    }
-
-    /** Parse an HTTP authority and return a host without brackets or port. */
-    std::string
-    remote_usb_parse_authority(std::string_view authority) {
-      if (authority.empty() || authority.size() > 512) {
-        return {};
-      }
-      for (const auto byte : authority) {
-        const auto value = static_cast<unsigned char>(byte);
-        if (value <= 0x20u || value >= 0x7fu) {
-          return {};
-        }
-      }
-
-      std::string_view host = authority;
-      if (authority.front() == '[') {
-        const auto closing = authority.find(']');
-        if (closing == std::string_view::npos || closing <= 1 ||
-            authority.find('[', 1) != std::string_view::npos ||
-            authority.find(']', closing + 1) != std::string_view::npos) {
-          return {};
-        }
-        host = authority.substr(1, closing - 1);
-        boost::system::error_code error;
-        const auto address = boost::asio::ip::make_address(host, error);
-        if (error || !address.is_v6() || address.is_unspecified()) {
-          return {};
-        }
-        if (closing + 1 < authority.size()) {
-          if (authority[closing + 1] != ':' ||
-              !remote_usb_valid_port(authority.substr(closing + 2))) {
-            return {};
-          }
-        }
-        return std::string { host };
-      }
-
-      if (authority.find('[') != std::string_view::npos ||
-          authority.find(']') != std::string_view::npos) {
-        return {};
-      }
-      const auto first_colon = authority.find(':');
-      if (first_colon != std::string_view::npos) {
-        /* IPv6 literals must use the bracketed authority form. */
-        if (first_colon != authority.rfind(':') ||
-            !remote_usb_valid_port(authority.substr(first_colon + 1))) {
-          return {};
-        }
-        host = authority.substr(0, first_colon);
-      }
-      if (!remote_usb_valid_reg_name(host) || remote_usb_unspecified_literal(host)) {
-        return {};
-      }
-      return std::string { host };
-    }
-
-    /**
-     * Return the concrete local address selected for the authenticated TLS
-     * socket.  A valid Host header is parsed as a fallback, but is never used
-     * when the kernel can report the actual destination interface; this keeps
-     * a client-controlled Host value from redirecting the broker endpoint.
-     */
-    std::string
-    remote_usb_request_host(const req_https_t &request) {
-      if (!request) {
-        return {};
-      }
-
-      std::string parsed_host;
-      const auto it = request->header.find("host");
-      if (it != request->header.end()) {
-        if (request->header.count("host") != 1) {
-          /* Multiple Host fields are ambiguous and should have been rejected
-           * by the HTTP parser; fail closed if one reaches the route. */
-          return {};
-        }
-        parsed_host = remote_usb_parse_authority(it->second);
-        if (parsed_host.empty()) {
-          return {};
-        }
-      }
-
-      try {
-        const auto local = request->local_endpoint();
-        if (local.port() != 0 && !local.address().is_unspecified()) {
-          return local.address().to_string();
-        }
-      }
-      catch (const std::exception &) {
-        /* Fall back to the already validated Host authority below. */
-      }
-      return parsed_host;
-    }
-
-    /**
-     * Canonicalize the current Moonlight uniqueid for the optional wire
-     * identity binding.  The fixed-width HELLO can carry either the legacy
-     * 16-byte ASCII hex identity or an opaque 16-byte identity represented by
-     * its 32-character uppercase hex rendering (used for UUID/hashed IDs).
-     */
-    std::string
-    remote_usb_wire_identity(const std::string &value) {
-      if ((value.size() != 16 && value.size() != 32) ||
-          !std::all_of(value.begin(), value.end(), [](unsigned char byte) {
-            return std::isxdigit(byte) != 0;
-          })) {
-        return {};
-      }
-
-      std::string normalized = value;
-      std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char byte) {
-        return static_cast<char>(std::toupper(byte));
-      });
-      return normalized;
-    }
-
-    std::string
-    remote_usb_wire_identity(const std::array<std::uint8_t, 16> &value) {
-      const bool printable = std::all_of(value.begin(), value.end(), [](std::uint8_t byte) {
-        return std::isprint(static_cast<unsigned char>(byte)) != 0;
-      });
-      if (printable) {
-        std::string text(reinterpret_cast<const char *>(value.data()), value.size());
-        if (const auto normalized = remote_usb_wire_identity(text); !normalized.empty()) {
-          return normalized;
-        }
-      }
-
-      static constexpr char hex[] = "0123456789ABCDEF";
-      std::string encoded;
-      encoded.reserve(value.size() * 2);
-      for (const auto byte : value) {
-        encoded.push_back(hex[(byte >> 4) & 0x0Fu]);
-        encoded.push_back(hex[byte & 0x0Fu]);
-      }
-      return encoded;
-    }
-
-  }  // namespace
-
   // Get the client certificate UUID authenticated on this request's TLS connection.
   std::string
   get_client_cert_uuid_from_request(req_https_t request) {
@@ -469,22 +273,63 @@ namespace nvhttp {
     launch_session->unique_id = (get_arg(args, "uniqueid", "unknown"));
     launch_session->client_name = (get_arg(args, "clientname", "unknown"));
     launch_session->appid = util::from_view(get_arg(args, "appid", "unknown"));
-    if (config::video.rtx_hdr == "per_app") {
-      if (const auto app_rtx_hdr = proc::proc.get_app_rtx_hdr_config(launch_session->appid)) {
-        launch_session->synthetic_hdr = *app_rtx_hdr;
-      }
-    }
     launch_session->enable_sops = util::from_view(get_arg(args, "sops", "0"));
     launch_session->surround_info = util::from_view(get_arg(args, "surroundAudioInfo", "196610"));
     launch_session->surround_params = (get_arg(args, "surroundParams", ""));
     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
     launch_session->gcmap = util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
+    if (launch_session->enable_hdr) {
+      if (const auto app_rtx_hdr = proc::proc.get_app_rtx_hdr_config(launch_session->appid); app_rtx_hdr && app_rtx_hdr->enabled) {
+        launch_session->hdr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::hdr);
+        if (launch_session->hdr_backend && launch_session->hdr_backend->id == image_enhancement::NVIDIA_RTX_VIDEO_BACKEND) {
+          launch_session->synthetic_hdr = *app_rtx_hdr;
+        }
+      }
+    }
+    if (const auto defaults = image_enhancement::load_nr_defaults()) {
+      const auto &f = defaults->filter;
+      launch_session->dlssnr_params.enabled = defaults->enabled;
+      launch_session->dlssnr_params.intensity = f.nr_intensity;
+      launch_session->dlssnr_params.style = f.nr_style;
+      launch_session->dlssnr_params.skin_structure_strength = f.nr_skin_structure_strength;
+      launch_session->dlssnr_params.auto_mask = f.nr_auto_mask;
+      launch_session->dlssnr_params.ui_correction = f.nr_ui_correction;
+      launch_session->dlssnr_params.motion_quality = f.nr_motion_quality;
+      launch_session->dlssnr_scale_percent = f.nr_scale_percent;
+    }
+    // Explicit per-app on/off settings take precedence; inherit uses the saved
+    // stream defaults. The overlay processing scale is currently global.
+    if (const auto app_dlssnr = proc::proc.get_app_dlssnr_config(launch_session->appid)) {
+      launch_session->dlssnr_params = *app_dlssnr;
+    }
+    if (launch_session->dlssnr_params.enabled) {
+      // Reserve both enabled backends until RTSP knows the final wire format.
+      // It selects RTX HDR only for PQ and releases the unused backend;
+      // HLG/SDR must retain NR even when launch initially requested RTX HDR.
+      launch_session->dlssnr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::nr);
+    }
     launch_session->use_vdd = util::from_view(get_arg(args, "useVdd", "0"));
     launch_session->custom_screen_mode = util::from_view(get_arg(args, "customScreenMode", "-1"));
     // Client-declared touch-keyboard intent (Sunshine protocol extension).
     // -1 undeclared: fall back to the per-client server profile.
     launch_session->touch_keyboard = util::from_view(get_arg(args, "touchKeyboard", "-1"));
+    // Client-declared controller emulation type (Sunshine protocol extension
+    // carried on the /launch and /resume query string). Values outside the
+    // host vocabulary are ignored with a warning and treated as undeclared.
+    {
+      auto declared_gamepad = get_arg(args, "gamepad", "");
+      if (!declared_gamepad.empty() &&
+          declared_gamepad != "auto"sv && declared_gamepad != "x360"sv &&
+          declared_gamepad != "ds4"sv && declared_gamepad != "ds5"sv) {
+        BOOST_LOG(warning) << "Ignoring unknown client gamepad preference: "sv << declared_gamepad;
+        declared_gamepad.clear();
+      }
+      launch_session->client_gamepad = declared_gamepad;
+      if (!declared_gamepad.empty()) {
+        BOOST_LOG(info) << "Client declared gamepad preference: "sv << declared_gamepad;
+      }
+    }
     const auto hdr_capabilities = hdr::parse_client_display_capabilities(
       find_arg(args, "maxBrightness"),
       find_arg(args, "minBrightness"),
@@ -496,23 +341,6 @@ namespace nvhttp {
                                           hdr::target_source_e::safe_defaults;
     if (!hdr_capabilities.fallback_reason.empty()) {
       BOOST_LOG(warning) << hdr_capabilities.fallback_reason << "; using safe HDR luminance defaults";
-    }
-
-    // Optional client-measured SDR reference white (moonlight-harmony extension).
-    // Parsed independently: a missing or out-of-range value simply leaves 0.
-    if (const auto sdr_white = find_arg(args, "sdrBrightness")) {
-      int parsed_sdr_white = 0;
-      const char *begin = sdr_white->data();
-      const char *end = begin + sdr_white->size();
-      const auto [position, parse_error] = std::from_chars(begin, end, parsed_sdr_white);
-      if (parse_error == std::errc {} && position == end && parsed_sdr_white >= 50 && parsed_sdr_white <= 1000) {
-        launch_session->reported_hdr_capabilities.sdr_white_nits = static_cast<float>(parsed_sdr_white);
-        launch_session->hdr_capabilities.sdr_white_nits = static_cast<float>(parsed_sdr_white);
-        BOOST_LOG(info) << "Client reported SDR white level: " << parsed_sdr_white << " nits";
-      }
-      else {
-        BOOST_LOG(warning) << "Ignoring out-of-range client SDR white level: " << *sdr_white;
-      }
     }
 
     // Get display_name from query parameter if provided
@@ -533,10 +361,16 @@ namespace nvhttp {
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
-    unsigned char raw_payload[8];
-    RAND_bytes(raw_payload, sizeof(raw_payload));
-    launch_session->av_ping_payload = util::hex_vec(raw_payload);
-    RAND_bytes((unsigned char *) &launch_session->control_connect_data, sizeof(launch_session->control_connect_data));
+    const auto random_data = crypto::rand(8 + sizeof(launch_session->control_connect_data));
+    if (random_data.size() != 8 + sizeof(launch_session->control_connect_data)) {
+      BOOST_LOG(error) << "Failed to generate launch session random data"sv;
+      return {};
+    }
+    launch_session->av_ping_payload = util::hex_vec(random_data.substr(0, 8));
+    std::memcpy(
+      &launch_session->control_connect_data,
+      random_data.data() + 8,
+      sizeof(launch_session->control_connect_data));
 
     launch_session->iv.resize(16);
     uint32_t prepend_iv = util::endian::big<uint32_t>(util::from_view(get_arg(args, "rikeyid")));
@@ -629,6 +463,10 @@ namespace nvhttp {
                << ", PATH: " << request->path;
 
     if (verbose_flag) {
+      // Headers stay disabled because authentication and proxy headers may
+      // contain credentials. Query values are limited to protocol fields that
+      // are useful for launch diagnostics and are not client credentials.
+      /*
       // Headers
       if (!request->header.empty()) {
         log_stream << ", HEADERS: ";
@@ -639,18 +477,35 @@ namespace nvhttp {
           first = false;
         }
       }
+      */
 
-      // Query parameters
+      static constexpr std::array safe_query_parameters {
+        "appid"sv,
+        "clientname"sv,
+        "continuousAudio"sv,
+        "corever"sv,
+        "customScreenMode"sv,
+        "display_name"sv,
+        "gamepad"sv,
+        "gcmap"sv,
+        "hdrMode"sv,
+        "localAudioPlayMode"sv,
+        "mode"sv,
+        "sops"sv,
+        "surroundAudioInfo"sv,
+        "surroundParams"sv,
+        "touchKeyboard"sv,
+        "uniqueid"sv,
+        "useVdd"sv,
+      };
       auto query_params = request->parse_query_string();
-      if (!query_params.empty()) {
-        log_stream << ", PARAMS: ";
-        bool first = true;
-        for (auto &[name, val] : query_params) {
-          if (!first) log_stream << "&";
-          log_stream << name << "=" << val;
-          first = false;
-        }
-      }
+      http_util::append_allowed_request_log_fields(
+        log_stream,
+        ", PARAMS: "sv,
+        query_params,
+        safe_query_parameters,
+        "&"sv
+      );
     }
     BOOST_LOG(debug) << log_stream.str();
   }
@@ -664,7 +519,8 @@ namespace nvhttp {
   template <class T>
   void
   print_request_warning_ip(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, const std::string &message) {
-    BOOST_LOG(warning) << message << " [" << request->query_string << "] from IP: " << request->remote_endpoint().address().to_string() << ", Port: " << request->remote_endpoint().port();
+    // Query strings may contain launch keys, so warnings only include routing context.
+    BOOST_LOG(warning) << message << " from IP: " << request->remote_endpoint().address().to_string() << ", Port: " << request->remote_endpoint().port();
   }
 
   template <class T>
@@ -855,6 +711,13 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     const auto launch_session = make_launch_session(host_audio, args);
+    if (!launch_session) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 500);
+      tree.put("root.<xmlattr>.status_message", "Failed to generate launch session credentials");
+      return;
+    }
+    const rtsp_stream::launch_preparation_guard_t launch_preparation;
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
     const auto fingerprint_match = client_fingerprint::match_client(args);
     launch_session->highly_suspected_unknown_client = fingerprint_match.suspicious;
@@ -1023,6 +886,17 @@ namespace nvhttp {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     const auto launch_session = make_launch_session(host_audio, args);
+    if (!launch_session) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 500);
+      tree.put("root.<xmlattr>.status_message", "Failed to generate launch session credentials");
+      return;
+    }
+    const rtsp_stream::launch_preparation_guard_t launch_preparation;
+    if (launch_session->width <= 0 || launch_session->height <= 0 || launch_session->fps <= 0) {
+      BOOST_LOG(warning) << "Resume request has no usable mode; keeping the current display resolution and refresh rate for compatibility. "sv
+                            "Update Moonlight-Switch to a version that sends mode on Resume when one is available."sv;
+    }
     launch_session->rtsp_peer_address = net::addr_to_normalized_string(request->remote_endpoint().address());
     const auto fingerprint_match = client_fingerprint::match_client(args);
     launch_session->highly_suspected_unknown_client = fingerprint_match.suspicious;
@@ -1132,41 +1006,7 @@ namespace nvhttp {
 
     // GameStream 的 /cancel 表示退出当前应用，而普通断开由 RTSP/控制通道处理。
     // 清理可能需要等待编码器和应用退出，不能阻塞 NVHTTP 工作线程。
-    if (!global_cancel_pending.test_and_set(boost::memory_order_acq_rel)) {
-      BOOST_LOG(info) << "Global app cancel accepted; stopping all streaming sessions asynchronously"sv;
-      rtsp_stream::terminate_sessions_async(stream::session::stop_reason_e::client_cancel, []() {
-        auto clear_pending = util::fail_guard([]() {
-          global_cancel_pending.clear(boost::memory_order_release);
-        });
-
-        try {
-          if (proc::proc.running() > 0) {
-            proc::proc.terminate();
-          }
-        }
-        catch (const std::exception &e) {
-          BOOST_LOG(error) << "Failed to terminate the running application during app cancel: "sv << e.what();
-        }
-        catch (...) {
-          BOOST_LOG(error) << "Failed to terminate the running application during app cancel"sv;
-        }
-
-        try {
-          display_device::session_t::get().restore_state();
-        }
-        catch (const std::exception &e) {
-          BOOST_LOG(error) << "Failed to restore display state during app cancel: "sv << e.what();
-        }
-        catch (...) {
-          BOOST_LOG(error) << "Failed to restore display state during app cancel"sv;
-        }
-
-        BOOST_LOG(info) << "Global app cancel cleanup finished"sv;
-      });
-    }
-    else {
-      BOOST_LOG(debug) << "Global app cancel is already in progress"sv;
-    }
+    stream::session::request_global_cancel("Global app cancel"sv);
   }
 
   void
@@ -1238,7 +1078,7 @@ namespace nvhttp {
     bool host_audio {};
 
     auto bind_address = net::get_bind_address(address_family);
-    auto is_file_mapping_client_paired = [](std::string_view client_uuid) {
+    auto is_client_paired = [](std::string_view client_uuid) {
       if (client_uuid.empty()) {
         return false;
       }
@@ -1259,32 +1099,46 @@ namespace nvhttp {
     file_mapping_config.certificate_file = config::nvhttp.cert;
     file_mapping_config.private_key_file = config::nvhttp.pkey;
     file_mapping_config.mappings_json = config::nvhttp.file_mappings;
-    file_mapping_config.authorize_client = is_file_mapping_client_paired;
+    file_mapping_config.authorize_client = is_client_paired;
     file_mapping_service.start(std::move(file_mapping_config));
 
-    remote_usb::remote_usb_service remote_usb_service;
-    const auto remote_usb_start_result = remote_usb_service.start(
-      remote_usb::service_config {
-        .bind_address = bind_address.empty() ? "0.0.0.0" : bind_address,
-        .certificate_file = config::nvhttp.cert,
-        .private_key_file = config::nvhttp.pkey,
-        .client_certificate_uuid = [](SSL *ssl) {
-          if (ssl == nullptr) {
-            return std::string {};
-          }
-          crypto::x509_t peer {
-#if OPENSSL_VERSION_MAJOR >= 3
-            SSL_get1_peer_certificate(ssl)
-#else
-            SSL_get_peer_certificate(ssl)
-#endif
-          };
-          return peer ? pairing::client_uuid_for_cert(peer.get()) : std::string {};
-        },
-      });
-    if (!remote_usb_start_result) {
-      BOOST_LOG(warning) << "Remote USB broker is unavailable: "
-                         << remote_usb_start_result.error;
+    // USB forwarding requires explicit host opt-in. Credentials are generated
+    // per service lifetime and delivered only over the paired HTTPS connection.
+    remote_usb::reverse_tunnel_service reverse_tunnel_service;
+    std::string usb_forwarding_token;
+    bool usb_forwarding_available = false;
+    if (config::nvhttp.usb_forwarding_enabled) {
+      const auto token_bytes = crypto::rand(32);
+      if (token_bytes.size() == 32) {
+        usb_forwarding_token = util::hex_vec(token_bytes);
+        remote_usb::reverse_tunnel_config tunnel_config;
+        tunnel_config.bind_address = bind_address.empty() ? "0.0.0.0" : bind_address;
+        // Resolve after the main port has been parsed. Its validated range
+        // reserves +21 for RTSP, so +7 cannot overflow a uint16_t.
+        tunnel_config.port = config::nvhttp.usb_forwarding_port != 0
+          ? config::nvhttp.usb_forwarding_port : net::map_port(7);
+        tunnel_config.session_token = usb_forwarding_token;
+        tunnel_config.certificate_file = config::nvhttp.cert;
+        tunnel_config.private_key_file = config::nvhttp.pkey;
+        tunnel_config.verify_client_cert = [](X509 *cert) {
+          return pairing::verify_client_certificate(cert, false) == nullptr;
+        };
+        // Optional USB forwarding must never claim a core TCP listener first.
+        const auto tunnel_port = tunnel_config.port;
+        const bool reserved_port = tunnel_port == port_http || tunnel_port == port_https ||
+          tunnel_port == net::map_port(confighttp::PORT_HTTPS) ||
+          tunnel_port == net::map_port(rtsp_stream::RTSP_SETUP_PORT);
+        if (!reserved_port) {
+          usb_forwarding_available = reverse_tunnel_service.start(std::move(tunnel_config));
+        }
+        else {
+          BOOST_LOG(warning) << "Remote USB forwarding port conflicts with a core TCP listener";
+        }
+      }
+      if (!usb_forwarding_available) {
+        usb_forwarding_token.clear();
+        BOOST_LOG(warning) << "Remote USB forwarding unavailable";
+      }
     }
 
     network_probe::service_t network_probe_service;
@@ -1346,6 +1200,32 @@ namespace nvhttp {
     https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
     https_server.resource["^/pair$"]["GET"] = pairing::pair_https;
     https_server.resource["^/applist$"]["GET"] = apps::list;
+    https_server.resource["^/api/v1/usb-forwarding$"]["GET"] =
+      [&](resp_https_t resp, req_https_t req) {
+        const SimpleWeb::CaseInsensitiveMultimap headers {
+          { "Content-Type", "application/json" },
+          { "Cache-Control", "no-store" },
+        };
+        // Do not trust the caller-supplied uniqueid, or relaxed TLS verification.
+        // Keep-alive identity is cached at handshake; pairing may since be revoked.
+        if (!is_client_paired(get_client_cert_uuid_from_request(req))) {
+          resp->write(SimpleWeb::StatusCode::client_error_unauthorized,
+            "{\"error\":\"pairing_required\"}", headers);
+          return;
+        }
+        nlohmann::json body {
+          { "version", 1 },
+          { "enabled", config::nvhttp.usb_forwarding_enabled },
+          { "available", usb_forwarding_available },
+          { "reason", !config::nvhttp.usb_forwarding_enabled ? "disabled" :
+                        usb_forwarding_available ? "ready" : "unavailable" },
+        };
+        if (usb_forwarding_available) {
+          body["port"] = reverse_tunnel_service.bound_port();
+          body["token"] = usb_forwarding_token;
+        }
+        resp->write(SimpleWeb::StatusCode::success_ok, body.dump(), headers);
+      };
     https_server.resource["^/appasset$"]["GET"] = apps::asset;
     https_server.resource["^/displays$"]["GET"] = display_control::get_displays;
     https_server.resource["^/display-scale-options$"]["GET"] = display_scale::get_options;
@@ -1387,168 +1267,6 @@ namespace nvhttp {
     https_server.resource["^/api/v1/file-mapping/session$"]["GET"] =
       [](resp_https_t resp, req_https_t req) {
         auto out = file_mapping_http::make_session_placeholder_response(req->header);
-        resp->write(out.status, out.body, out.headers);
-      };
-
-    /*
-     * Issue a short-lived, one-shot capability for the independent Remote
-     * USB broker.  The HTTPS connection has already passed the paired-client
-     * certificate verifier above; the certificate UUID is therefore the
-     * authenticated identity, while the 16-byte client uniqueid and the three
-     * lease tokens are retained as independent HELLO bindings (the identities
-     * are intentionally distinct in Sunshine's pairing state).
-     */
-    https_server.resource["^/api/v1/remote-usb/capability$"]["GET"] =
-      [&](resp_https_t resp, req_https_t req) {
-        const auto args = req->parse_query_string();
-        const auto generation_it = args.find("stream_generation");
-        if (generation_it == args.end() || args.count("stream_generation") != 1) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::client_error_bad_request,
-            "invalid_generation");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        /*
-         * Lease tokens are bearer material. New clients send them in
-         * dedicated HTTPS headers so they never appear in request URLs or
-         * the access logs of a reverse proxy. Keep a query fallback for older
-         * clients during the protocol migration, but reject a partial or
-         * ambiguous header tuple instead of silently mixing sources.
-         */
-        std::string session_token;
-        std::string attachment_token;
-        std::string lease_token;
-        const auto read_unique_header = [&](const std::string &name,
-                                             std::string &value) {
-          if (req->header.count(name) != 1) {
-            return false;
-          }
-          const auto it = req->header.find(name);
-          if (it == req->header.end()) {
-            return false;
-          }
-          value = it->second;
-          return true;
-        };
-        const bool has_token_header =
-          req->header.count("X-Remote-USB-Session-Token") != 0 ||
-          req->header.count("X-Remote-USB-Attachment-Token") != 0 ||
-          req->header.count("X-Remote-USB-Lease-Token") != 0;
-        if (has_token_header) {
-          if (!read_unique_header("X-Remote-USB-Session-Token", session_token) ||
-              !read_unique_header("X-Remote-USB-Attachment-Token", attachment_token) ||
-              !read_unique_header("X-Remote-USB-Lease-Token", lease_token) ||
-              args.count("session_token") != 0 ||
-              args.count("attachment_token") != 0 ||
-              args.count("lease_token") != 0) {
-            const auto out = remote_usb_http::make_error_response(
-              SimpleWeb::StatusCode::client_error_bad_request,
-              "ambiguous_token_binding");
-            resp->write(out.status, out.body, out.headers);
-            return;
-          }
-        }
-        else {
-          const auto session_it = args.find("session_token");
-          const auto attachment_it = args.find("attachment_token");
-          const auto lease_it = args.find("lease_token");
-          if (session_it == args.end() || attachment_it == args.end() ||
-              lease_it == args.end() || args.count("session_token") != 1 ||
-              args.count("attachment_token") != 1 || args.count("lease_token") != 1) {
-            const auto out = remote_usb_http::make_error_response(
-              SimpleWeb::StatusCode::client_error_bad_request,
-              "missing_token");
-            resp->write(out.status, out.body, out.headers);
-            return;
-          }
-          session_token = session_it->second;
-          attachment_token = attachment_it->second;
-          lease_token = lease_it->second;
-        }
-
-        std::string parse_error;
-        const auto request = remote_usb_http::parse_capability_request(
-          generation_it->second,
-          session_token,
-          attachment_token,
-          lease_token,
-          parse_error);
-        if (!request) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::client_error_bad_request,
-            "invalid_token_binding", parse_error);
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        const auto client_uuid = get_client_cert_uuid_from_request(req);
-        if (client_uuid.empty()) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::client_error_unauthorized,
-            "client_not_paired");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        const auto uniqueid_it = args.find("uniqueid");
-        if (uniqueid_it == args.end() || args.count("uniqueid") != 1) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::client_error_bad_request,
-            "missing_uniqueid");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        const auto wire_identity = remote_usb_wire_identity(uniqueid_it->second);
-        if (wire_identity.empty()) {
-          /* The v1 Android/native exporter uses a 16-byte ASCII hex ID.  Do
-           * not issue a capability that cannot be bound to that HELLO. */
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::client_error_bad_request,
-            "invalid_uniqueid");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        const auto endpoint_host = remote_usb_request_host(req);
-        if (endpoint_host.empty()) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::server_error_service_unavailable,
-            "broker_unavailable");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        const auto issued = remote_usb_service.issue_capability(
-          remote_usb::capability_issue_request {
-            .client_uuid = client_uuid,
-            .stream_generation = request->stream_generation,
-            .endpoint_host = endpoint_host,
-            .wire_client_uuid = wire_identity,
-            .session_token = request->session_token,
-            .attachment_token = request->attachment_token,
-            .lease_token = request->lease_token,
-          });
-        if (issued.status == remote_usb::capability_issue_status::unavailable ||
-            issued.status == remote_usb::capability_issue_status::unsupported) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::server_error_service_unavailable,
-            issued.status == remote_usb::capability_issue_status::unsupported
-              ? "unsupported_platform" : "broker_unavailable");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-        if (!issued) {
-          const auto out = remote_usb_http::make_error_response(
-            SimpleWeb::StatusCode::client_error_too_many_requests,
-            "capability_limit");
-          resp->write(out.status, out.body, out.headers);
-          return;
-        }
-
-        const auto out = remote_usb_http::make_capability_response(*issued.value);
         resp->write(out.status, out.body, out.headers);
       };
 
@@ -1642,7 +1360,7 @@ namespace nvhttp {
     ssl.join();
     tcp.join();
 
-    remote_usb_service.stop();
+    reverse_tunnel_service.stop();
     file_mapping_service.stop();
   }
 

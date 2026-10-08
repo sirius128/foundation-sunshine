@@ -6,16 +6,26 @@
 #include "remote_usb_host_controller.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <system_error>
 #include <utility>
 
 #include <boost/asio/ip/address.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/process/v1.hpp>
+#include <boost/process/v1/async_pipe.hpp>
+#include <boost/process/v1/extend.hpp>
 #include <boost/process/v1/pipe.hpp>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace remote_usb {
 namespace {
@@ -25,6 +35,154 @@ namespace bp = boost::process::v1;
 using namespace std::chrono_literals;
 
 constexpr std::uint16_t kMaxHubPort = 255;
+
+/* Once the helper exited, the pipes reach EOF as soon as the last writer is
+ * gone; this only bounds how long a surviving writer may delay that. */
+constexpr auto kReaderDrainGrace = 500ms;
+
+#ifdef _WIN32
+/*
+ * Boost.Process launches the helper with bInheritHandles and without a handle
+ * list, so it inherits every inheritable handle this process owns: the RTSP
+ * and HTTPS listeners, the log file, and whatever else happens to be open.
+ * usbip-win2 may leave a worker process behind, and an orphaned worker then
+ * keeps those handles - and the ports bound through them - alive after
+ * Sunshine exits, which leaves a stale listener and a service that cannot be
+ * started again (AlkaidLab/foundation-sunshine#1080).
+ *
+ * Hand the helper exactly the handles its own redirections use, the way the
+ * other Windows spawn sites in this tree do.
+ */
+class inherit_only_child_handles : public bp::extend::handler {
+public:
+  template <typename Executor>
+  void on_setup(Executor &executor) const {
+    /* Run after the redirections: they mark their own handles inheritable as
+     * they set themselves up, and a handle list may only name inheritable
+     * handles - the process group's job handle, for one, is not. */
+    std::vector<HANDLE> handles;
+    bp::extend::foreach_used_handle(executor, [&handles](HANDLE handle) {
+      DWORD flags = 0;
+      if (handle && handle != INVALID_HANDLE_VALUE &&
+          GetHandleInformation(handle, &flags) && (flags & HANDLE_FLAG_INHERIT) &&
+          std::find(handles.begin(), handles.end(), handle) == handles.end()) {
+        handles.push_back(handle);
+      }
+    });
+    if (handles.empty()) {
+      executor.set_error(std::make_error_code(std::errc::invalid_argument),
+                         "usbip helper would inherit no handles");
+      return;
+    }
+
+    SIZE_T attribute_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+    auto storage = std::make_shared<std::vector<unsigned char>>(attribute_size);
+    auto *attribute_buffer = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage->data());
+    if (!InitializeProcThreadAttributeList(attribute_buffer, 1, 0, &attribute_size)) {
+      executor.set_error(std::error_code(static_cast<int>(GetLastError()), std::system_category()),
+                         "InitializeProcThreadAttributeList() failed");
+      return;
+    }
+
+    /* Both the list and the handles it names have to stay valid until the
+     * process is created, so they live in members rather than on this frame.
+     * Taking ownership only here keeps a failed list out of the deleter. */
+    storage_ = std::move(storage);
+    attributes_ = std::make_shared<attribute_list>(attribute_buffer);
+    handles_ = std::make_shared<std::vector<HANDLE>>(std::move(handles));
+    if (!UpdateProcThreadAttribute(attributes_->get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   handles_->data(), handles_->size() * sizeof(HANDLE), nullptr, nullptr)) {
+      executor.set_error(std::error_code(static_cast<int>(GetLastError()), std::system_category()),
+                         "UpdateProcThreadAttribute() failed");
+      return;
+    }
+
+    executor.set_startup_info_ex();
+    executor.startup_info_ex.lpAttributeList = attributes_->get();
+    executor.inherit_handles = true;
+  }
+
+private:
+  struct attribute_list {
+    explicit attribute_list(LPPROC_THREAD_ATTRIBUTE_LIST value): list(value) {}
+    ~attribute_list() {
+      if (list) {
+        DeleteProcThreadAttributeList(list);
+      }
+    }
+    LPPROC_THREAD_ATTRIBUTE_LIST get() const { return list; }
+
+  private:
+    LPPROC_THREAD_ATTRIBUTE_LIST list;
+  };
+
+  /* Shared and mutable: on_setup is const, and the executor keeps its own copy
+   * of every handler it runs. */
+  mutable std::shared_ptr<std::vector<unsigned char>> storage_;
+  mutable std::shared_ptr<attribute_list> attributes_;
+  mutable std::shared_ptr<std::vector<HANDLE>> handles_;
+};
+
+/*
+ * Boost's process group is a job object, but one that does not kill what is
+ * left in it when the last handle closes. A helper that outlives Sunshine -
+ * after a crash, or a service restart - therefore survives as an orphan.
+ * Tie the group's processes to the job handle instead, and report a failure
+ * rather than launching a helper that could be orphaned again.
+ */
+std::error_code
+kill_helpers_with_parent(const bp::group &group) noexcept {
+  const auto job = reinterpret_cast<HANDLE>(group.native_handle());
+  if (!job) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+
+  /* Read first: the limit flags are a set, and Boost enables break-away on
+   * this job for its own reasons. */
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+  if (!QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr)) {
+    return std::error_code(static_cast<int>(GetLastError()), std::system_category());
+  }
+  limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+    return std::error_code(static_cast<int>(GetLastError()), std::system_category());
+  }
+  return {};
+}
+#endif
+
+std::string
+resolve_executable(std::string executable) {
+  const std::filesystem::path requested(executable);
+  if (requested.has_parent_path()) {
+    return executable;
+  }
+
+  const auto discovered = bp::search_path(executable);
+  if (!discovered.empty()) {
+    return discovered.string();
+  }
+
+#ifdef _WIN32
+  /* usbip-win2's installer does not add its directory to the service account's
+   * PATH. Sunshine normally runs as LocalSystem, so also probe the standard
+   * machine-wide install directory. */
+  for (const char *variable: {"ProgramW6432", "ProgramFiles"}) {
+    const auto *program_files = std::getenv(variable);
+    if (!program_files || !*program_files) {
+      continue;
+    }
+    const auto candidate = std::filesystem::path(program_files) / "USBip" / requested;
+    std::error_code error;
+    if (std::filesystem::is_regular_file(candidate, error)) {
+      return candidate.string();
+    }
+  }
+#endif
+
+  return executable;
+}
 
 std::string
 platform_default_executable() {
@@ -58,6 +216,34 @@ append_bounded(std::string &destination,
   destination.append(value.data(), std::min(remaining, value.size()));
 }
 
+void
+drain_pipe(bp::async_pipe &pipe,
+           asio::io_context &context,
+           std::string &destination,
+           std::size_t maximum,
+           const std::shared_ptr<std::atomic_bool> &stop) noexcept {
+  try {
+    std::array<char, 4096> buffer {};
+    std::function<void()> read_next;
+    read_next = [&]() {
+      pipe.async_read_some(asio::buffer(buffer), [&](const auto &error, std::size_t count) {
+        if (count != 0) {
+          append_bounded(destination, std::string_view(buffer.data(), count), maximum);
+        }
+        /* A read that finishes just before the stop flag is set must not post
+         * its successor, or nothing would ever cancel that successor. */
+        if (!error && !stop->load(std::memory_order_acquire)) {
+          read_next();
+        }
+      });
+    };
+    read_next();
+    context.run();
+  }
+  catch (...) {
+  }
+}
+
 /*
  * Drain both child pipes concurrently.  usbip-win2 normally prints a single
  * line, but draining rather than relying on a fixed pipe buffer keeps a broken
@@ -71,17 +257,33 @@ run_process(const std::string &executable,
             std::size_t max_output_bytes,
             const usbip_reader_thread_factory &reader_thread_factory) {
   usbip_command_result result;
-  bp::ipstream standard_output;
-  bp::ipstream standard_error;
+  asio::io_context output_context;
+  asio::io_context error_context;
+  bp::async_pipe standard_output(output_context);
+  bp::async_pipe standard_error(error_context);
   std::error_code launch_error;
   bp::child child;
+  // usbip-win2 may launch a worker process that inherits our output pipes.
+  // Keep the complete helper tree in a process group so timeout/cancel also
+  // closes those inherited handles and the reader threads can finish.
+  bp::group process_group;
+#ifdef _WIN32
+  // What the helper does not need must not reach it in the first place.
+  const inherit_only_child_handles inherit_policy;
+#else
+  /* POSIX closes the descriptors the child was not given, which enforces the
+   * same rule from the other side of the fork. */
+  const auto &inherit_policy = bp::limit_handles;
+#endif
 
   try {
-    child = bp::child(executable,
+    child = bp::child(resolve_executable(executable),
                       bp::args(arguments),
+                      process_group,
                       bp::std_in < bp::null,
                       bp::std_out > standard_output,
                       bp::std_err > standard_error,
+                      inherit_policy,
                       launch_error);
   }
   catch (const std::exception &exception) {
@@ -95,29 +297,71 @@ run_process(const std::string &executable,
 
   std::thread output_reader;
   std::thread error_reader;
-  try {
-    output_reader = reader_thread_factory([&]() {
-      std::string line;
-      while (std::getline(standard_output, line)) {
-        append_bounded(result.standard_output, line, max_output_bytes);
-        if (result.standard_output.size() < max_output_bytes) {
-          append_bounded(result.standard_output, "\n", max_output_bytes);
-        }
+  std::atomic<int> readers_pending { 2 };
+  const auto stop_readers = std::make_shared<std::atomic_bool>(false);
+  const auto terminate_tree = [&]() noexcept {
+    std::error_code group_error;
+    process_group.terminate(group_error);
+    if (!group_error) {
+      return group_error;
+    }
+
+    /* A failed group termination must not leave a descendant holding either
+     * output pipe open forever. Terminate the direct child as a best effort;
+     * the caller cancels the asynchronous reads before joining them. */
+    std::error_code child_error;
+    child.terminate(child_error);
+    return group_error;
+  };
+  const auto cancel_readers = [&]() noexcept {
+    /* Stop first, then cancel through each pipe's own context: cancelling from
+     * here can otherwise land between a completion handler and the read it
+     * posts, leaving that read to run forever. */
+    stop_readers->store(true, std::memory_order_release);
+    asio::post(output_context, [&standard_output] {
+      try {
+        standard_output.cancel();
+      }
+      catch (...) {
       }
     });
-    error_reader = reader_thread_factory([&]() {
-      std::string line;
-      while (std::getline(standard_error, line)) {
-        append_bounded(result.standard_error, line, max_output_bytes);
-        if (result.standard_error.size() < max_output_bytes) {
-          append_bounded(result.standard_error, "\n", max_output_bytes);
-        }
+    asio::post(error_context, [&standard_error] {
+      try {
+        standard_error.cancel();
       }
+      catch (...) {
+      }
+    });
+  };
+
+#ifdef _WIN32
+  /* Configure the group only now that it has taken part in a launch: Boost
+   * documents a default-constructed group as undefined to use before that.
+   * A helper that cannot be tied to this process is not worth running, and
+   * terminate_tree has the fallback for a group that will not stop either. */
+  if (const auto group_error = kill_helpers_with_parent(process_group)) {
+    terminate_tree();
+    std::error_code ignored;
+    child.wait(ignored);
+    result.standard_error = "usbip helpers would not be tied to this process: " + group_error.message();
+    return result;
+  }
+#endif
+
+  try {
+    output_reader = reader_thread_factory([&]() {
+      drain_pipe(standard_output, output_context, result.standard_output, max_output_bytes, stop_readers);
+      readers_pending.fetch_sub(1, std::memory_order_acq_rel);
+    });
+    error_reader = reader_thread_factory([&]() {
+      drain_pipe(standard_error, error_context, result.standard_error, max_output_bytes, stop_readers);
+      readers_pending.fetch_sub(1, std::memory_order_acq_rel);
     });
   }
   catch (const std::exception &exception) {
+    terminate_tree();
+    cancel_readers();
     std::error_code ignored;
-    child.terminate(ignored);
     child.wait(ignored);
     if (output_reader.joinable()) {
       output_reader.join();
@@ -130,8 +374,9 @@ run_process(const std::string &executable,
     return result;
   }
   catch (...) {
+    terminate_tree();
+    cancel_readers();
     std::error_code ignored;
-    child.terminate(ignored);
     child.wait(ignored);
     if (output_reader.joinable()) {
       output_reader.join();
@@ -151,15 +396,13 @@ run_process(const std::string &executable,
     if (cancel && cancel->load(std::memory_order_acquire)) {
       result.cancelled = true;
       terminated = true;
-      std::error_code ignored;
-      child.terminate(ignored);
+      terminate_tree();
       break;
     }
     if (std::chrono::steady_clock::now() >= deadline) {
       result.timed_out = true;
       terminated = true;
-      std::error_code ignored;
-      child.terminate(ignored);
+      terminate_tree();
       break;
     }
     std::this_thread::sleep_for(5ms);
@@ -167,10 +410,32 @@ run_process(const std::string &executable,
 
   std::error_code wait_error;
   child.wait(wait_error);
+  /* The direct helper may exit while one of its descendants still owns the
+   * inherited pipe handles. Terminate the remaining group before joining the
+   * readers so normal-exit, cancellation, and timeout all use the same path. */
+  const auto group_error = terminate_tree();
+  if (group_error) {
+    cancel_readers();
+  }
+  /* A descendant that survived termination can still own a pipe's write end.
+   * Waiting for it without a bound used to keep this operation - and one of
+   * the four concurrency slots it holds - forever, so give the pipes the time
+   * an exiting helper needs and take the readers down after that. */
+  const auto drain_deadline = std::chrono::steady_clock::now() + kReaderDrainGrace;
+  while (readers_pending.load(std::memory_order_acquire) != 0 &&
+         std::chrono::steady_clock::now() < drain_deadline) {
+    std::this_thread::sleep_for(2ms);
+  }
+  if (readers_pending.load(std::memory_order_acquire) != 0) {
+    cancel_readers();
+  }
   output_reader.join();
   error_reader.join();
   if (wait_error && !terminated) {
     result.standard_error = wait_error.message();
+  }
+  else if (group_error && !terminated) {
+    append_bounded(result.standard_error, group_error.message(), max_output_bytes);
   }
   result.exit_code = child.exit_code();
   return result;
@@ -281,13 +546,12 @@ usbip_host_controller::dispatch(operation_kind kind,
   }
 
   const bool valid_request = kind == operation_kind::attach
-                               ? valid_endpoint(request.server_endpoint) &&
-                                   valid_identity(request.identity)
+                               ? valid_endpoint(request.server_endpoint)
                                : valid_binding(binding);
   if (!valid_request) {
     usbip_host_result result;
     result.status = usbip_host_status::invalid_argument;
-    result.detail = "invalid usbip host endpoint or lease identity";
+    result.detail = "invalid usbip host endpoint";
     try {
       completion(std::move(result));
     }
@@ -327,14 +591,12 @@ usbip_host_controller::dispatch(operation_kind kind,
         }
         if (candidate_active &&
             ((kind == operation_kind::attach &&
-              candidate->request.identity == request.identity &&
-              candidate->request.stream_generation == request.stream_generation) ||
+              candidate->request.server_endpoint == request.server_endpoint) ||
              (kind == operation_kind::detach &&
-              candidate->binding.identity == binding.identity &&
-              candidate->binding.stream_generation == binding.stream_generation))) {
+              candidate->binding == binding))) {
           immediate_result = invalid_result(usbip_host_status::busy,
                                              0,
-                                             "the lease already has an operation");
+                                             "the device already has an operation");
           break;
         }
       }
@@ -342,30 +604,24 @@ usbip_host_controller::dispatch(operation_kind kind,
         const auto accepted = std::find_if(
           accepted_bindings_.begin(), accepted_bindings_.end(),
           [&request](const usbip_host_binding &candidate) {
-            return candidate.identity == request.identity &&
-                   candidate.stream_generation == request.stream_generation;
+            return candidate.server_endpoint == request.server_endpoint;
           });
         if (accepted != accepted_bindings_.end()) {
           immediate_result = invalid_result(
             usbip_host_status::busy, 0,
-            "the lease is already attached");
+            "the endpoint is already attached");
         }
       }
       if (!immediate_result && kind == operation_kind::detach) {
         const auto accepted = std::find_if(
           accepted_bindings_.begin(), accepted_bindings_.end(),
           [&binding](const usbip_host_binding &candidate) {
-            return candidate.identity == binding.identity &&
-                   candidate.server_endpoint.address == binding.server_endpoint.address &&
-                   candidate.server_endpoint.port == binding.server_endpoint.port &&
-                   candidate.server_endpoint.busid == binding.server_endpoint.busid &&
-                   candidate.hub_port == binding.hub_port &&
-                   candidate.stream_generation == binding.stream_generation;
+            return candidate == binding;
           });
         if (accepted == accepted_bindings_.end()) {
           immediate_result = invalid_result(
             usbip_host_status::invalid_argument, 0,
-            "the lease is not attached by this controller");
+            "the binding is not attached by this controller");
         }
       }
       if (!immediate_result && active >= config_.max_concurrent_operations) {
@@ -391,7 +647,12 @@ usbip_host_controller::dispatch(operation_kind kind,
               [candidate](const std::shared_ptr<operation> &existing) {
                 return existing->id == candidate;
               });
-            if (collision == operations_.end()) {
+            const auto binding_collision = std::find_if(
+              accepted_bindings_.begin(), accepted_bindings_.end(),
+              [candidate](const usbip_host_binding &existing) {
+                return existing.binding_id == candidate;
+              });
+            if (collision == operations_.end() && binding_collision == accepted_bindings_.end()) {
               return candidate;
             }
           }
@@ -839,7 +1100,7 @@ usbip_host_controller::run_attach(const std::shared_ptr<operation> &operation) {
     return result;
   }
   const auto &request = operation->request;
-  if (!valid_endpoint(request.server_endpoint) || !valid_identity(request.identity)) {
+  if (!valid_endpoint(request.server_endpoint)) {
     result.status = usbip_host_status::invalid_argument;
     result.detail = "invalid usbip attach request";
     return result;
@@ -854,7 +1115,7 @@ usbip_host_controller::run_attach(const std::shared_ptr<operation> &operation) {
     "--tcp-port", std::to_string(request.server_endpoint.port),
     "attach", "--remote", request.server_endpoint.address,
     "--bus-id", request.server_endpoint.busid,
-    "--once", "--terse", "--receive-mode", "zero-copy"
+    "--once", "--terse"
   };
   usbip_command_result command;
   try {
@@ -890,9 +1151,8 @@ usbip_host_controller::run_attach(const std::shared_ptr<operation> &operation) {
   result.status = usbip_host_status::ok;
   result.binding = usbip_host_binding {
     request.server_endpoint,
-    request.identity,
     *hub_port,
-    request.stream_generation,
+    operation->id,
   };
   return result;
 }
@@ -970,13 +1230,8 @@ usbip_host_controller::valid_endpoint(const endpoint &value) noexcept {
 }
 
 bool
-usbip_host_controller::valid_identity(const usbip_host_identity &value) noexcept {
-  return value.session_token != 0 && value.attachment_token != 0 && value.lease_token != 0;
-}
-
-bool
 usbip_host_controller::valid_binding(const usbip_host_binding &value) noexcept {
-  return valid_endpoint(value.server_endpoint) && valid_identity(value.identity) &&
+  return valid_endpoint(value.server_endpoint) && value.binding_id != 0 &&
          value.hub_port >= 1 && value.hub_port <= kMaxHubPort;
 }
 
@@ -1158,8 +1413,7 @@ usbip_host_controller::remember_binding_locked(const usbip_host_binding &binding
   const auto exists = std::find_if(
     accepted_bindings_.begin(), accepted_bindings_.end(),
     [&binding](const usbip_host_binding &candidate) {
-      return candidate.identity == binding.identity &&
-             candidate.stream_generation == binding.stream_generation;
+      return candidate == binding;
     });
   if (exists == accepted_bindings_.end()) {
     accepted_bindings_.push_back(binding);
@@ -1171,9 +1425,7 @@ usbip_host_controller::forget_binding_locked(const usbip_host_binding &binding) 
   accepted_bindings_.erase(
     std::remove_if(accepted_bindings_.begin(), accepted_bindings_.end(),
       [&binding](const usbip_host_binding &candidate) {
-        return candidate.identity == binding.identity &&
-               candidate.hub_port == binding.hub_port &&
-               candidate.stream_generation == binding.stream_generation;
+        return candidate == binding;
       }),
     accepted_bindings_.end());
 }

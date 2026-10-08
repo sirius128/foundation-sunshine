@@ -8,24 +8,28 @@
 
 #include "process.h"
 
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <latch>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
-#include <random>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <cstdio>
 #include <ctime>
 #include <thread>
 #include <utility>
+
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
@@ -43,8 +47,11 @@
 #include <boost/asio/ssl/context_base.hpp>
 
 #include "config.h"
+#include "image_enhancement/api.h"
+#include "image_enhancement/config.h"
 #include "confighttp.h"
 #include "clipboard_http.h"
+#include "text_context/http.h"
 #include "ai/credential_store.h"
 #include "crypto.h"
 #include "display_device/color_profile.h"
@@ -58,6 +65,7 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "nvenc/frame_budget.h"
 #include "perf_recorder.h"
 #include "platform/common.h"
 #include "platform/run_command.h"
@@ -70,6 +78,7 @@
 #include "video.h"
 #include "version.h"
 #include "webhook/webhook.h"
+#include "widget_http.h"
 #include "webhook/webhook_api.h"
 
 #ifdef _WIN32
@@ -111,6 +120,9 @@ namespace confighttp {
                << ", METHOD: " << request->method
                << ", PATH: " << request->path;
     
+    // Headers stay disabled because authentication and proxy headers may
+    // contain credentials.
+    /*
     // Headers
     if (!request->header.empty()) {
       log_stream << ", HEADERS: ";
@@ -122,17 +134,20 @@ namespace confighttp {
       }
     }
     
-    // Query parameters
+    */
+
+    static constexpr std::array safe_query_parameters {
+      "bitrate"sv,
+      "clientname"sv,
+    };
     auto query_params = request->parse_query_string();
-    if (!query_params.empty()) {
-      log_stream << ", PARAMS: ";
-      bool first = true;
-      for (auto &[name, val] : query_params) {
-        if (!first) log_stream << "&";
-        log_stream << name << "=" << val;
-        first = false;
-      }
-    }
+    http_util::append_allowed_request_log_fields(
+      log_stream,
+      ", PARAMS: "sv,
+      query_params,
+      safe_query_parameters,
+      "&"sv
+    );
     
     BOOST_LOG(verbose) << log_stream.str();
   }
@@ -183,6 +198,70 @@ namespace confighttp {
     return true;
   }
 
+  namespace {
+    struct request_header_value_t {
+      bool valid;
+      std::optional<std::string_view> value;
+    };
+
+    request_header_value_t
+    get_single_request_header(const req_https_t &request, const std::string_view name) {
+      const auto range = request->header.equal_range(std::string { name });
+      if (range.first == range.second) {
+        return { true, std::nullopt };
+      }
+
+      auto first = range.first;
+      const auto value = std::string_view { first->second };
+      if (++first != range.second) {
+        return { false, std::nullopt };
+      }
+      return { true, value };
+    }
+
+    void
+    send_cross_site_forbidden(resp_https_t response) {
+      const nlohmann::json body {
+        { "status", false },
+        { "error", "Cross-site request denied" },
+      };
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      headers.emplace("X-Frame-Options", "DENY");
+      headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+      response->write(SimpleWeb::StatusCode::client_error_forbidden, body.dump(), headers);
+    }
+
+    bool
+    authorize_browser_request(resp_https_t response, req_https_t request) {
+      const auto path = std::string_view { request->path };
+      if (!path.starts_with("/api/") &&
+          !path.starts_with("/steam-api/") &&
+          !path.starts_with("/steam-store/")) {
+        return true;
+      }
+
+      const auto origin = get_single_request_header(request, "origin");
+      const auto referer = get_single_request_header(request, "referer");
+      const auto fetch_site = get_single_request_header(request, "sec-fetch-site");
+      const auto host = get_single_request_header(request, "host");
+      const auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      if (!origin.valid || !referer.valid || !fetch_site.valid || !host.valid ||
+          !http_util::browser_request_source_allowed(
+            origin.value,
+            referer.value,
+            fetch_site.value,
+            host.value.value_or(std::string_view {}),
+            net::from_address(address) == net::PC
+          )) {
+        BOOST_LOG(debug) << "Web UI: rejected cross-site browser request to ["sv << request->path << ']';
+        send_cross_site_forbidden(std::move(response));
+        return false;
+      }
+      return true;
+    }
+  }  // namespace
+
   void
   send_unauthorized(resp_https_t response, req_https_t request) {
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
@@ -200,6 +279,8 @@ namespace confighttp {
    */
   void
   handleLogout(resp_https_t response, req_https_t request) {
+    if (!authorize_browser_request(response, request)) return;
+
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
     auto ip_type = net::from_address(address);
 
@@ -231,6 +312,8 @@ namespace confighttp {
 
   bool
   authenticate(resp_https_t response, req_https_t request) {
+    if (!authorize_browser_request(response, request)) return false;
+
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
     auto ip_type = net::from_address(address);
 
@@ -1263,10 +1346,31 @@ namespace confighttp {
 
     auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
     for (auto &[name, value] : vars) {
+      // widget_token 是本地端点凭证,不回显明文;只暴露是否已配置
+      if (name == "widget_token") {
+        continue;
+      }
       outputTree.put(std::move(name), std::move(value));
     }
+    outputTree.put("widget_token_configured", !config::sunshine.widget_token.empty());
 
     outputTree.put("active_encoder", video::active_encoder_name());
+    if (auto frame_budget = nvenc::get_frame_budget_report()) {
+      pt::ptree budget_node;
+      budget_node.put("clamped", frame_budget->clamped);
+      budget_node.put("configured_preset", frame_budget->configured_preset);
+      budget_node.put("effective_preset", frame_budget->effective_preset);
+      budget_node.put("width", frame_budget->width);
+      budget_node.put("height", frame_budget->height);
+      budget_node.put("fps", frame_budget->fps);
+      budget_node.put("budget_ms", frame_budget->budget_ms);
+      budget_node.put("estimated_ms", frame_budget->estimated_ms);
+      budget_node.put("configured_estimated_ms", frame_budget->configured_estimated_ms);
+      budget_node.put("num_engines", frame_budget->num_engines);
+      outputTree.add_child("active_nvenc_frame_budget", budget_node);
+    }
+    // Configuration capability only; never expose the paired-client tunnel token here.
+    outputTree.put("usb_forwarding_config_version", "1");
     outputTree.put("pair_name", nvhttp::get_pair_name());
   }
 
@@ -1426,6 +1530,13 @@ namespace confighttp {
   }
 
   void
+  write_runtime_error(resp_https_t response, SimpleWeb::StatusCode http_status, int status_code, const std::string &status_message);
+
+  bool
+  require_localhost(resp_https_t response, req_https_t request, const std::string &action);
+
+
+  void
   saveConfig(resp_https_t response, req_https_t request) {
     if (!check_content_type(response, request, "application/json")) return;
     if (!authenticate(response, request)) return;
@@ -1468,6 +1579,7 @@ namespace confighttp {
       // 将 inputTree 转换为 std::map（保证有序）
       std::map<std::string, std::string> fullConfig;
       for (const auto &kv : inputTree) {
+        if (kv.first == "usb_forwarding_config_version") continue;
         std::string value = inputTree.get<std::string>(kv.first);
         fullConfig[kv.first] = value;
       }
@@ -1487,6 +1599,155 @@ namespace confighttp {
     }
 
     outputTree.put("status", "true");
+  }
+
+  void
+  getGamepadConfig(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    pt::ptree outputTree;
+    auto response_guard = util::fail_guard([&]() {
+      std::ostringstream data;
+      pt::write_json(data, outputTree);
+      response->write(data.str());
+    });
+
+    const auto config_snapshot = config::get_config_snapshot();
+    if (!config_snapshot) {
+      outputTree.put("status", "false");
+      outputTree.put("error", "failed to read controller configuration");
+      return;
+    }
+
+    const auto get_value = [&](std::string_view key, std::string_view fallback) {
+      const auto entry = config_snapshot->find(std::string {key});
+      return entry == config_snapshot->end() ? std::string {fallback} : entry->second;
+    };
+    outputTree.put("status", "true");
+    outputTree.put("gamepad", get_value("gamepad", "auto"));
+    outputTree.put("motion_as_ds4", get_value("motion_as_ds4", "true"));
+    outputTree.put("touchpad_as_ds4", get_value("touchpad_as_ds4", "true"));
+    outputTree.put("ds4_back_as_touchpad_click", get_value("ds4_back_as_touchpad_click", "true"));
+    outputTree.put("enable_dsu_server", get_value("enable_dsu_server", "false"));
+    outputTree.put("dsu_server_port", get_value("dsu_server_port", "26760"));
+  }
+
+  void
+  saveGamepadConfig(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request)) return;
+
+    pt::ptree outputTree;
+    auto response_guard = util::fail_guard([&]() {
+      std::ostringstream data;
+      pt::write_json(data, outputTree);
+      response->write(data.str());
+    });
+
+    try {
+      pt::ptree inputTree;
+      std::stringstream body;
+      body << request->content.rdbuf();
+      pt::read_json(body, inputTree);
+      if (inputTree.empty() || inputTree.size() > 6) {
+        throw std::invalid_argument("controller configuration patch must contain 1 to 6 fields");
+      }
+
+      const std::set<std::string> boolean_fields {
+        "ds4_back_as_touchpad_click",
+        "enable_dsu_server",
+        "motion_as_ds4",
+        "touchpad_as_ds4",
+      };
+      std::map<std::string, std::string> updates;
+      for (const auto &[key, node] : inputTree) {
+        if (!node.empty()) {
+          throw std::invalid_argument("controller configuration fields must be scalar values");
+        }
+        const auto value = node.get_value<std::string>();
+        if (key == "gamepad") {
+          if (value != "auto"sv && value != "x360"sv && value != "ds4"sv && value != "ds5"sv) {
+            throw std::invalid_argument("invalid gamepad mode");
+          }
+        }
+        else if (boolean_fields.contains(key)) {
+          if (value != "true"sv && value != "false"sv) {
+            throw std::invalid_argument("controller boolean fields must be true or false");
+          }
+        }
+        else if (key == "dsu_server_port") {
+          std::size_t parsed = 0;
+          const auto port = std::stoi(value, &parsed);
+          if (parsed != value.size() || port < 1024 || port > 65535) {
+            throw std::invalid_argument("DSU port must be between 1024 and 65535");
+          }
+        }
+        else {
+          throw std::invalid_argument("unsupported controller configuration field");
+        }
+        if (!updates.emplace(key, value).second) {
+          throw std::invalid_argument("duplicate controller configuration field");
+        }
+      }
+
+      if (!config::update_config(updates)) {
+        outputTree.put("status", "false");
+        outputTree.put("error", "failed to persist controller configuration");
+        return;
+      }
+      outputTree.put("status", "true");
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(warning) << "SaveGamepadConfig: "sv << e.what();
+      outputTree.put("status", "false");
+      outputTree.put("error", "invalid controller configuration patch");
+    }
+  }
+
+  void
+  getImageEnhancementConfig(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !require_localhost(response, request, "Image enhancement configuration")) return;
+    image_enhancement::api::get_config(response);
+  }
+
+  void
+  saveImageEnhancementConfig(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request) || !require_localhost(response, request, "Image enhancement configuration")) return;
+    image_enhancement::api::save_config(response, request);
+  }
+
+  void
+  getImageEnhancementStatus(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !require_localhost(response, request, "Image enhancement status")) return;
+    image_enhancement::api::get_status(response);
+  }
+
+  void
+  getEnhancementSessions(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request) || !require_localhost(response, request, "Session image enhancement")) return;
+    image_enhancement::api::get_sessions(response);
+  }
+
+  void
+  setSessionNr(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request) || !require_localhost(response, request, "Session image enhancement")) return;
+    image_enhancement::api::set_session_nr(response, request);
+  }
+
+  void
+  rememberSessionNr(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request) || !require_localhost(response, request, "Session image enhancement")) return;
+    image_enhancement::api::remember_session_nr(response, request);
+  }
+
+  void
+  maintainImageEnhancementComponent(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
+    if (!authenticate(response, request) || !require_localhost(response, request, "Image enhancement maintenance")) return;
+    image_enhancement::api::maintenance(response, request);
   }
 
   void
@@ -1786,6 +2047,7 @@ namespace confighttp {
 
   void
   savePassword(resp_https_t response, req_https_t request) {
+    if (!authorize_browser_request(response, request)) return;
     if (!check_content_type(response, request, "application/json")) return;
     if (!config::sunshine.username.empty() && !authenticate(response, request)) return;
 
@@ -1836,9 +2098,14 @@ namespace confighttp {
             outputTree.put("error", "Password Mismatch");
           }
           else {
-            http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
-            http::reload_user_creds(config::sunshine.credentials_file);
-            outputTree.put("status", true);
+            if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword) != 0 ||
+                http::reload_user_creds(config::sunshine.credentials_file) != 0) {
+              outputTree.put("status", false);
+              outputTree.put("error", "Failed to save credentials");
+            }
+            else {
+              outputTree.put("status", true);
+            }
           }
         }
         else {
@@ -1958,8 +2225,14 @@ namespace confighttp {
     });
 
     // Generate a random 4-digit PIN using OpenSSL CSPRNG
-    uint16_t random_val;
-    RAND_bytes(reinterpret_cast<unsigned char *>(&random_val), sizeof(random_val));
+    const auto random_bytes = crypto::rand(sizeof(std::uint16_t));
+    if (random_bytes.size() != sizeof(std::uint16_t)) {
+      outputTree.put("status", false);
+      outputTree.put("error", "Failed to generate pairing PIN");
+      return;
+    }
+    std::uint16_t random_val;
+    std::memcpy(&random_val, random_bytes.data(), sizeof(random_val));
     int pin_num = random_val % 10000;
     char pin_buf[5];
     std::snprintf(pin_buf, sizeof(pin_buf), "%04d", pin_num);
@@ -2135,6 +2408,7 @@ namespace confighttp {
 
   void
   renameClient(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
     if (!authenticate(response, request)) return;
 
     print_req(request);
@@ -2386,6 +2660,7 @@ namespace confighttp {
 
     try {
       const auto statuses = video::get_hdr_pipeline_statuses();
+      const auto enhancement_status = image_enhancement::manager().status();
       json response_json {
         { "success", true },
         { "status_code", 200 },
@@ -2397,7 +2672,8 @@ namespace confighttp {
 #endif
         { "configured_analysis_mode", config::video.hdr_luminance_analysis },
         { "configured_conversion_mode", config::video.capture_compute_shader },
-        { "configured_rtx_hdr_mode", config::video.rtx_hdr },
+        { "configured_hdr_backend", enhancement_status.value("selected_backend", std::string {}) },
+        { "configured_nr_backend", enhancement_status.value("selected_nr_backend", std::string {}) },
         { "pipelines", json::array() },
       };
 
@@ -2415,6 +2691,9 @@ namespace confighttp {
           { "synthetic_hdr_backend", status.synthetic_hdr_backend },
           { "synthetic_hdr_state", status.synthetic_hdr_state },
           { "synthetic_hdr_failure_reason", status.synthetic_hdr_failure_reason },
+          { "nr_backend", status.nr_backend },
+          { "nr_state", status.nr_state },
+          { "nr_failure_reason", status.nr_failure_reason },
         });
       }
 
@@ -2496,6 +2775,41 @@ namespace confighttp {
     }
     catch (...) {
       BOOST_LOG(error) << "getRuntimeHdrCalibration: Unknown exception";
+      write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, "Unknown error");
+    }
+  }
+
+  void
+  stopRuntimeSessions(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    print_req(request);
+
+    if (!require_localhost(response, request, "stopping runtime sessions")) {
+      return;
+    }
+
+    try {
+      // 终止当前全部串流会话(所有客户端),语义与 Game Bar widget 的 stop_all_sessions 一致
+      rtsp_stream::terminate_sessions_async(
+        stream::session::stop_reason_e::host_terminate,
+        boost::function<void()>([] {}));
+      BOOST_LOG(info) << "Config API: session termination requested from local panel"sv;
+
+      response->write(json {
+                          { "success", true },
+                          { "status_message", "session termination requested" },
+                        }
+                         .dump(),
+        { { "Content-Type", "application/json" } });
+      response->close_connection_after_response = true;
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(error) << "stopRuntimeSessions: " << e.what();
+      write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, e.what());
+    }
+    catch (...) {
+      BOOST_LOG(error) << "stopRuntimeSessions: Unknown exception";
       write_runtime_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, 500, "Unknown error");
     }
   }
@@ -2666,7 +2980,7 @@ namespace confighttp {
       targetUrl += "?" + request->query_string;
     }
 
-    BOOST_LOG(info) << "Steam API proxy request: " << targetUrl;
+    BOOST_LOG(info) << "Steam API proxy request path: " << http_util::sanitize_request_log_value(path);
 
     // 安全检查：防止SSRF，确保目标主机确实是api.steampowered.com
     if (http::url_get_host(targetUrl) != "api.steampowered.com") {
@@ -2683,13 +2997,10 @@ namespace confighttp {
         // 设置响应头
         SimpleWeb::CaseInsensitiveMultimap headers;
         headers.emplace("Content-Type", "application/json");
-        headers.emplace("Access-Control-Allow-Origin", "*");
-        headers.emplace("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        headers.emplace("Access-Control-Allow-Headers", "Content-Type, Authorization");
         
         response->write(SimpleWeb::StatusCode::success_ok, content, headers);
       } else {
-        BOOST_LOG(error) << "Steam API request failed: " << targetUrl;
+        BOOST_LOG(error) << "Steam API request failed for path: " << http_util::sanitize_request_log_value(path);
         response->write(SimpleWeb::StatusCode::server_error_internal_server_error, "Steam API request failed");
       }
     } catch (const std::exception& e) {
@@ -2717,7 +3028,7 @@ namespace confighttp {
       targetUrl += "?" + request->query_string;
     }
 
-    BOOST_LOG(info) << "Steam Store proxy request: " << targetUrl;
+    BOOST_LOG(info) << "Steam Store proxy request path: " << http_util::sanitize_request_log_value(path);
 
     // 安全检查：防止SSRF，确保目标主机确实是store.steampowered.com
     if (http::url_get_host(targetUrl) != "store.steampowered.com") {
@@ -2734,13 +3045,10 @@ namespace confighttp {
         // 设置响应头
         SimpleWeb::CaseInsensitiveMultimap headers;
         headers.emplace("Content-Type", "application/json");
-        headers.emplace("Access-Control-Allow-Origin", "*");
-        headers.emplace("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        headers.emplace("Access-Control-Allow-Headers", "Content-Type, Authorization");
         
         response->write(SimpleWeb::StatusCode::success_ok, content, headers);
       } else {
-        BOOST_LOG(error) << "Steam Store request failed: " << targetUrl;
+        BOOST_LOG(error) << "Steam Store request failed for path: " << http_util::sanitize_request_log_value(path);
         response->write(SimpleWeb::StatusCode::server_error_internal_server_error, "Steam Store request failed");
       }
     } catch (const std::exception& e) {
@@ -3346,6 +3654,7 @@ namespace confighttp {
    */
   void
   proxyAiChat(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
     if (!authenticate(response, request)) return;
     print_req(request);
 
@@ -3689,7 +3998,21 @@ namespace confighttp {
 
   void
   testMenuCmd(resp_https_t response, req_https_t request) {
+    if (!check_content_type(response, request, "application/json")) return;
     if (!authenticate(response, request)) return;
+
+    constexpr bool test_command_enabled = false;
+    if (!test_command_enabled) {
+      const nlohmann::json body {
+        { "status", false },
+        { "error", "Test command execution is temporarily disabled" },
+        { "error_code", "TEST_COMMAND_DISABLED" },
+      };
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      response->write(SimpleWeb::StatusCode::server_error_service_unavailable, body.dump(), headers);
+      return;
+    }
 
     // 安全限制：只允许局域网访问测试命令功能
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
@@ -3842,6 +4165,15 @@ namespace confighttp {
     server.resource["^/api/apps$"]["POST"] = saveApp;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
+    server.resource["^/api/gamepad/config$"]["GET"] = getGamepadConfig;
+    server.resource["^/api/gamepad/config$"]["POST"] = saveGamepadConfig;
+    server.resource["^/api/hdr-enhanced/config$"]["GET"] = getImageEnhancementConfig;
+    server.resource["^/api/hdr-enhanced/config$"]["POST"] = saveImageEnhancementConfig;
+    server.resource["^/api/hdr-enhanced/status$"]["GET"] = getImageEnhancementStatus;
+    server.resource["^/api/hdr-enhanced/sessions$"]["GET"] = getEnhancementSessions;
+    server.resource["^/api/hdr-enhanced/session-nr$"]["POST"] = setSessionNr;
+    server.resource["^/api/hdr-enhanced/session-nr/remember$"]["POST"] = rememberSessionNr;
+    server.resource["^/api/hdr-enhanced/components/([a-z0-9_.-]+)/maintenance$"]["POST"] = maintainImageEnhancementComponent;
     server.resource["^/api/webhook/config$"]["GET"] = getWebhookConfig;
     server.resource["^/api/webhook/config$"]["POST"] = saveWebhookConfig;
     server.resource["^/api/webhook/test$"]["POST"] = testWebhook;
@@ -3876,6 +4208,7 @@ namespace confighttp {
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/apps/test-menu-cmd$"]["POST"] = testMenuCmd;
     server.resource["^/api/runtime/sessions$"]["GET"] = getRuntimeSessions;
+    server.resource["^/api/runtime/sessions/stop$"]["POST"] = stopRuntimeSessions;
     server.resource["^/api/runtime/hdr$"]["GET"] = getRuntimeHdrStatus;
     server.resource["^/api/runtime/hdr-calibration$"]["GET"] = getRuntimeHdrCalibration;
     server.resource["^/api/runtime/bitrate$"]["GET"] = changeRuntimeBitrate;
@@ -3904,14 +4237,33 @@ namespace confighttp {
       [](clipboard_http::resp_https_t resp, clipboard_http::req_https_t req) {
         return authenticate(std::move(resp), std::move(req));
       });
-    tray_http::auth_fn tray_local_auth = [](tray_http::resp_https_t resp, tray_http::req_https_t req) {
+    text_context::http::register_routes(server,
+      [](text_context::http::resp_https_t resp, text_context::http::req_https_t req) {
         const auto address = net::addr_to_normalized_string(req->remote_endpoint().address());
-        if (config::sunshine.username.empty() && net::from_address(address) == net::PC) {
-          return true;
+        if (net::from_address(address) != net::PC) {
+          resp->write(SimpleWeb::StatusCode::client_error_forbidden);
+          return false;
         }
         return authenticate(std::move(resp), std::move(req));
-      };
+      });
+    tray_http::auth_fn tray_local_auth = [](tray_http::resp_https_t resp, tray_http::req_https_t req) {
+      const auto address = net::addr_to_normalized_string(req->remote_endpoint().address());
+      if (config::sunshine.username.empty() && net::from_address(address) == net::PC) {
+        return authorize_browser_request(std::move(resp), std::move(req));
+      }
+      return authenticate(std::move(resp), std::move(req));
+    };
     tray_http::register_routes(server, tray_local_auth, tray_local_auth);
+    // Game Bar widget 通道:仅环回,凭证由模块内的 X-Sunshine-Token(widget_token)校验,
+    // 不复用 basic-auth——widget 是本地 packaged app,没有浏览器语义。
+    widget_http::register_routes(server, [](widget_http::resp_https_t resp, widget_http::req_https_t req) {
+      const auto address = net::addr_to_normalized_string(req->remote_endpoint().address());
+      if (net::from_address(address) != net::PC) {
+        resp->write(SimpleWeb::StatusCode::client_error_forbidden);
+        return false;
+      }
+      return true;
+    });
     server.resource["^/assets\\/.+$"]["GET"] = getNodeModules;
     server.config.reuse_address = true;
     server.config.address = net::get_bind_address(address_family);
@@ -3925,15 +4277,64 @@ namespace confighttp {
     // base64 cover-upload endpoint.
     server.config.max_request_streambuf_size = 16 * 1024 * 1024;
 
-    auto accept_and_run = [&](https_server_t *server) {
+    // A concrete bind address intentionally limits remote Sunshine traffic to
+    // one interface. Keep an IPv4 loopback-only Web UI listener so the local
+    // GUI/tray and Control Panel entry points remain available. The Panel
+    // intentionally uses 127.0.0.1, including when the configured address is
+    // IPv6.
+    std::optional<https_server_t> loopback_server;
+    if (!config::sunshine.bind_address.empty()) {
+      boost::system::error_code bind_error;
+      const auto configured_address = boost::asio::ip::make_address(config::sunshine.bind_address, bind_error);
+      if (!bind_error && (configured_address.is_v6() || !configured_address.is_unspecified())) {
+        const bool already_uses_panel_loopback = configured_address.is_v4() &&
+          configured_address.to_v4() == boost::asio::ip::address_v4::loopback();
+        if (!already_uses_panel_loopback) {
+          loopback_server.emplace(config::nvhttp.cert, config::nvhttp.pkey);
+          loopback_server->default_resource = server.default_resource;
+          loopback_server->resource = server.resource;
+          loopback_server->config.reuse_address = true;
+          loopback_server->config.address = "127.0.0.1";
+          loopback_server->config.port = port_https;
+          loopback_server->config.thread_pool_size = server.config.thread_pool_size;
+          loopback_server->config.max_request_streambuf_size = server.config.max_request_streambuf_size;
+        }
+      }
+    }
+
+    auto accept_and_run = [&](https_server_t *server,
+                              const char *listener_name,
+                              std::string listener_address,
+                              bool required,
+                              const std::shared_ptr<std::latch> &startup_latch,
+                              const std::shared_ptr<std::atomic_bool> &startup_signaled) {
+      const auto signal_startup = [&]() {
+        if (startup_latch && startup_signaled && !startup_signaled->exchange(true)) {
+          startup_latch->count_down();
+        }
+      };
       try {
-        server->start([](unsigned short port) {
-          BOOST_LOG(debug) << "Configuration UI available at [https://localhost:"sv << port << "]"sv;
+        server->start([listener_name,
+                       listener_address = std::move(listener_address),
+                       startup_latch,
+                       startup_signaled](unsigned short port) {
+          if (startup_latch && startup_signaled && !startup_signaled->exchange(true)) {
+            startup_latch->count_down();
+          }
+          BOOST_LOG(debug) << "Configuration UI listener ["sv << listener_name << "] ready at [https://"
+                            << listener_address << ':' << port << "]"sv;
         });
       }
       catch (boost::system::system_error &err) {
+        signal_startup();
         // It's possible the exception gets thrown after calling server->stop() from a different thread
         if (shutdown_event->peek()) {
+          return;
+        }
+        if (!required) {
+          BOOST_LOG(warning) << "Optional Configuration UI listener ["sv << listener_name
+                             << "] could not start on ["sv << listener_address << ':' << port_https
+                             << "]: "sv << err.what();
           return;
         }
         BOOST_LOG(fatal) << "Couldn't start Configuration HTTPS server on port ["sv << port_https << "]: "sv << err.what();
@@ -3941,18 +4342,66 @@ namespace confighttp {
         return;
       }
       catch (std::exception &err) {
+        signal_startup();
+        if (shutdown_event->peek()) {
+          return;
+        }
+        if (!required) {
+          BOOST_LOG(warning) << "Optional Configuration UI listener ["sv << listener_name
+                             << "] failed on ["sv << listener_address << ':' << port_https
+                             << "]: "sv << err.what();
+          return;
+        }
         BOOST_LOG(fatal) << "Configuration HTTPS server failed to start: "sv << err.what();
         shutdown_event->raise(true);
         return;
       }
     };
-    std::thread tcp { accept_and_run, &server };
+    const auto listener_host = [](const std::string &address) {
+      boost::system::error_code error;
+      const auto parsed = boost::asio::ip::make_address(address, error);
+      return error ? address : net::addr_to_url_escaped_string(parsed);
+    };
+
+    std::thread tcp {
+      accept_and_run,
+      &server,
+      "configured",
+      listener_host(server.config.address),
+      true,
+      nullptr,
+      nullptr
+    };
+    std::thread loopback_tcp;
+    std::shared_ptr<std::latch> loopback_startup_latch;
+    std::shared_ptr<std::atomic_bool> loopback_startup_signaled;
+    if (loopback_server) {
+      loopback_startup_latch = std::make_shared<std::latch>(1);
+      loopback_startup_signaled = std::make_shared<std::atomic_bool>(false);
+      loopback_tcp = std::thread {
+        accept_and_run,
+        &*loopback_server,
+        "loopback",
+        listener_host(loopback_server->config.address),
+        false,
+        loopback_startup_latch,
+        loopback_startup_signaled
+      };
+      loopback_startup_latch->wait();
+    }
 
     // Wait for any event
     shutdown_event->view();
 
+    image_enhancement::api::shutdown();
     server.stop();
+    if (loopback_server) {
+      loopback_server->stop();
+    }
 
     tcp.join();
+    if (loopback_tcp.joinable()) {
+      loopback_tcp.join();
+    }
   }
 }  // namespace confighttp
