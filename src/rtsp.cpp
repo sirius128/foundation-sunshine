@@ -1908,13 +1908,6 @@ namespace rtsp_stream {
         parse_surround_params(session.surround_params, config.audio.channels, config.audio.customStreamParams);
     }
 
-    if (config.audio.channels == 12 && !config.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS]) {
-      config.audio.customStreamParams.channelCount = 12;
-      config.audio.customStreamParams.streams = 8;
-      config.audio.customStreamParams.coupledStreams = 4;
-      std::copy_n(std::begin(platf::speaker::map_surround714), 12, std::begin(config.audio.customStreamParams.mapping));
-      config.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = true;
-    }
     if (session.continuous_audio) {
       BOOST_LOG(info) << "Client requested continuous audio"sv;
       config.audio.flags[audio::config_t::CONTINUOUS_AUDIO] = true;
