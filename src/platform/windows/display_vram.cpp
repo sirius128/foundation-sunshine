@@ -2394,7 +2394,7 @@ namespace platf::dxgi {
     }
 
     /**
-     * @brief Read HDR analysis results from the staging buffer (previous frame).
+     * @brief Read the pending HDR analysis sample from the staging buffer.
      * GPU has already reduced all groups to one FinalResult — CPU just reads it
      * and computes PQ-domain percentiles from the histogram.
      */
@@ -3040,7 +3040,9 @@ namespace platf::dxgi {
       const auto output_format = hdr_output ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
       const auto plane_format = hdr_output ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
 
-      if (base_.init(display, display->adapter.get(), pixel_format, {}, config) != 0) {
+      const bool dynamic_metadata = config.dynamic_hdr_format != 0;
+      if (base_.init(display, display->adapter.get(), pixel_format,
+            { .hdr10plus = dynamic_metadata, .vivid = dynamic_metadata }, config) != 0) {
         return false;
       }
 
@@ -3120,8 +3122,14 @@ namespace platf::dxgi {
       }
 
       base_.apply_colorspace(colorspace);
-      return base_.init_output(
-               conversion_output_.get(), config.width, config.height, colorspace, video_format) == 0;
+      if (base_.init_output(conversion_output_.get(), config.width, config.height, colorspace, video_format) != 0) {
+        return false;
+      }
+      if (dynamic_metadata && !base_.hdr_luminance_analysis_available()) {
+        BOOST_LOG(warning) << "PyroWave dynamic HDR requires the HDR luminance analyzer";
+        return false;
+      }
+      return true;
     }
 
     int
@@ -3155,6 +3163,13 @@ namespace platf::dxgi {
     ID3D11Device *d3d_device() noexcept override { return base_.device.get(); }
     ID3D11DeviceContext *d3d_context() noexcept override { return base_.device_ctx.get(); }
     const std::array<shared_yuv_plane_t, 3> &yuv_planes() const noexcept override { return planes_; }
+
+    bool collect_hdr_luminance_stats() override {
+      base_.read_hdr_analysis_results();
+      hdr_luminance_stats = base_.hdr_luminance_stats_out;
+      // A pending readback does not invalidate the previous scene sample.
+      return hdr_luminance_stats.valid;
+    }
 
   private:
     d3d_base_encode_device base_;
@@ -3375,6 +3390,7 @@ namespace platf::dxgi {
 
       ::amf::amf_config amf_cfg;
       amf_cfg.avcodec_compat = config::video.amd.amd_avcodec_compat;
+      amf_cfg.hevc_gop_size = config::video.amd.amd_hevc_gop_size;
 
       // Pass AMF SDK integer values directly from config
       if (client_config.videoFormat == 0) {

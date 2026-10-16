@@ -38,13 +38,38 @@ CPU staging 回退。切换共享捕获内存类型只允许在当前会话独�
 GPU 图像；不兼容的新 GPU 会话在接入时被拒绝，避免读取错误类型的图像。捕获后端覆盖只作用于
 本次创建，不改写会话保存的捕获设置。HDR10/PQ、HLG 和 GPU 专属增强初始化失败时结束当前视频会话，
 不尝试 CPU 回退。实际资源检查发生在编码器工厂中，不代表 ANNOUNCE 已完成全部 GPU 预检。显式选择
-PyroWave 时不会在同一次连接中自动切换到 HEVC/AV1；用户需要修复能力或手动选择
-其他编码器后重新连接。
+PyroWave 已建立后的运行故障不会在同一次活动连接中切换到 HEVC/AV1；用户需要修复能力或
+手动选择其他编码器后重新连接。初始客户端能力协商未选中 PyroWave 时保留 common-c 的
+H.264 兼容兜底，并由客户端在连接成功后提示实际格式。
 设备兼容性由实际资源检查决定，不能从进程级探针推导所有显示器和 GPU 都可用。
 
-PyroWave 的 HDR 合同目前覆盖 HDR10/PQ 和 HLG，并通过公共能力字段和 SDP 属性
-传递色彩元数据。动态 HDR10+、Dolby Vision、HDR Vivid 等格式不在当前合同中，
-不能因为系统或客户端报告了 HDR 就假定它们已经可用。
+外部信号量能力查询只用于诊断；缺少能力位仍尝试实际创建和导入。Windows 前置检查不
+要求用不到的 KMT、opaque 或 D3D12 内存类型，实际会话仍分别导入所需的 R8/R16 平面。
+编码器初始化时先用同一共享 Fence 验证 D3D11→Vulkan，在首个正常 GPU 编码完成、
+发布视频帧前验证 Vulkan→D3D11 的返回值，各自最多等待 1 秒。不额外要求生产流程
+未使用的 Vulkan 主机 Signal 路径。验证只判断同步有效性，不设性能门槛，也不逐帧
+重复；创建、导入或验证失败时记录真实阶段并走既有失败处理。
+
+PyroWave 的 HDR 合同覆盖 HDR10/PQ 和 HLG。Vivid 在实际 Vulkan device 同时具备
+`VK_HUAWEI_hdr_vivid`、`hdrVivid` feature、`VK_EXT_hdr_metadata` 和可用入口时走原生
+Vivid PQ/HLG；HDR10+ 与 Dolby Vision 8.1/8.4 在客户端使用应用映射 shader，输出仍为
+协商的 PQ/HLG 基础信号。应用映射不代表厂商认证输出。动态会话要求开启 HDR 亮度分析；
+未请求动态 metadata 的会话不增加分析成本。
+
+`dynamic_hdr.*` 复用现有桌面亮度统计和动态 HDR 序列化。与 HEVC 一样，共享分析器每四个
+可分析的转换帧调度一次分析，并以非阻塞方式轮询读回。生产器保存本编码会话最近有效的
+场景统计，每个已协商的动态 HDR 编码帧都生成独立 payload；新样本到达后更新场景状态。没有
+新样本或新统计无效时继续使用有效状态，不阻塞采集、不丢帧，也不将这种采样间隔当成
+编码后端故障。transport 在推进下一帧前复制完整 payload，客户端不缓存缺失的 TLV。
+
+首次没有有效场景统计时暂缓发布，最多等待 1.5 秒；超时则结束该视频会话，不伪造动态
+metadata，也不在活动连接中切换编码器。有效状态随编码器重建或重新配置清空，不继承其他
+会话或旧显示器的统计。原生 Vivid 使用 Sunshine 生成的统计和 UWA base curve 参数，
+通过受保护 TLV 交给客户端的原生 Vulkan metadata 接口；HDR10+ 和 Dolby Vision 由客户端
+执行受限 LUT、reshape 和矩阵映射。这里不接受任意
+影片曲线、Profile 5/7、NLQ 或增强层。
+Vivid/PQ 的 system_start_code 为 0x01，Vivid/HLG 按 UWA 005.1 附录 B.3 使用 0x02；
+该修正须由两端生产/消费配套，不改 Frame Envelope 的字段、版本或 FEC。
 
 像素转换、平面位深和码流颜色元数据都以实际解析的输出色彩空间为准。若请求 HDR 而
 捕获结果仍为 SDR，且没有产生 HDR 的增强管线，则拒绝创建该 PyroWave 会话；不能把 SDR
@@ -64,8 +89,9 @@ block 容量，保证它与一个外层 RTP payload 对齐。客户端先恢复�
 data block，先提取 metadata，再依据 codec payload 长度去掉 metadata 和末尾填充，将纯编码
 数据交给 decoder。恢复不了的帧在 deadline 后丢弃。
 块级 FEC 是协商的必需能力；恢复规则与帧时限由公共协议实现统一校验。
-Frame Header 还携带完整 metadata 副本，因此 metadata 必须能放入扣除 64 字节封套头后的
-单包容量。使用默认包长时遵守相同限制；超限请求在复制前拒绝，不截断 TLV。
+完整 metadata 作为受保护 payload 的前缀，可以跨多个 DATA 包。Frame Header 的单包
+副本不是权威载荷，接收端必须从 DATA/PARITY 恢复完整 metadata，不能应用截断的 TLV。
+总 metadata 上限为 65535 字节，Runtime、动态 HDR 和 HLG 名义峰值的 TLV 头均计入上限。
 
 主机处理耗时使用受保护的可选 Runtime TLV。只有 metadata 非空时才设置外层 metadata
 标记；重复帧不携带该 TLV。发布层区分分包成功与合法的失败结果，失败不入队，也不发送空帧。
@@ -100,7 +126,7 @@ Surface、尺寸和实际 Vulkan 创建预检，避免仅凭默认设备探针�
 
 ### 诊断与性能记录
 
-探针、D3D11/Vulkan 资源导入、fence、颜色合同、编码、分包和客户端 Surface/交换链失败
+D3D11/Vulkan 资源导入、fence、颜色合同、编码、分包和客户端 Surface/交换链失败
 都会在本地日志中记录阶段、API/Vulkan 返回码以及必要的帧号、尺寸、码流大小或块数。
 成功帧不逐帧写诊断日志；客户端对同一失败阶段只记录一次，避免网络或驱动持续失败时刷屏。
 
@@ -111,12 +137,21 @@ Surface、尺寸和实际 Vulkan 创建预检，避免仅凭默认设备探针�
 
 ## API 与可复现构建
 
-当前 Sunshine 适配器使用 PyroWave API `0.6.1`、protocol version `2`、bitstream version `2`
+当前 Sunshine 适配器使用 PyroWave API `101.0.0`（基于上游 `1.0.0`）、protocol version `2`、bitstream version `2`
 和 payload version `3`。源版本由 `third-party/pyrowave` 的子模块 gitlink 固定，Granite、
 Volk 和 Vulkan-Headers 由其嵌套子模块固定。Sunshine 使用 `add_subdirectory()` 直接构建
 `pyrowave-c-api-static`，通过 CMake target 链接 C API、核心和必要的 Granite 静态依赖。
 不复制源码、不应用本地补丁，也不在构建脚本中维护另一份提交 SHA。源文件修改由
 CMake/Ninja 的依赖图跟踪，所有产物位于构建目录，不需要单独运行 PowerShell 脚本。
+
+`101.0.0` 是 AlkaidLab fork 的原生 API 版本，不是上游版本号，也不改变网络协议版本。
+两端精确校验该版本和必需函数入口，不将上游 1.x 运行库视为本项目运行库的替代品。
+
+编码器采用上游 `encode_cpu` / `encode_gpu` 接口，保留默认 frame context 0 的同步交付。
+按 GPU LUID 创建设备时使用普通 `MEDIUM` 队列优先级，不请求提权或实时优先级。
+客户端 GPU HDR 输出精度由 R16 平面格式决定；CPU 输出精度由 buffer format 决定，
+不再扩展 decoder create-info。HLG 的协商扩展和 `SS_HDR_METADATA` 呈现通道保持独立。
+上游 `PWV1Header` 用于文件/容器封装，不替代 common-c Frame Envelope，网络合同版本不变。
 
 common-c 协议、PyroWave 子模块和分裂着色器均由版本控制固定；构建基线不依赖本地补丁
 或手工生成的运行库副本。
@@ -133,4 +168,4 @@ common-c 协议、PyroWave 子模块和分裂着色器均由版本控制固定�
 PyroWave、Granite、Volk 和 Vulkan-Headers 的许可证通知随安装/发布流程保留。Granite
 由 PyroWave 的嵌套子模块提供，不成为 Sunshine 的独立运行时依赖；PyroWave C API、
 核心和 Granite 静态归档会在链接阶段合并进 Sunshine，不需要额外的
-`libpyrowave-shared-0.dll`。
+PyroWave 运行库 DLL。

@@ -12,13 +12,17 @@ PyroWave 是面向高带宽局域网的实验性视频格式。它采用帧内�
 |---|---|
 | 服务端 | Windows Sunshine 实验版本 |
 | 客户端 | 配套的 Moonlight V+ Android 实验版本 |
-| 视频 | SDR、静态 HDR10/PQ、静态 HLG |
+| 视频 | SDR、HDR10/PQ、HLG；Vivid 使用原生 Vulkan 能力，HDR10+ 与 Dolby Vision 使用客户端应用映射 |
 | 色彩 | BT.709 或 BT.2020、4:2:0、limited/full range |
 | 位深 | SDR 固定 8-bit；HDR10/PQ 与 HLG 固定 10-bit |
 | 网络 | 高带宽局域网，优先使用有线网络 |
 | 默认行为 | 不改变现有编码器的默认选择 |
 
 Windows Sunshine 通过 CMake 子项目将 PyroWave 核心和 C API 静态链接进主程序，不需要单独的构建脚本或额外安装 PyroWave DLL。源版本由子模块 gitlink 固定。客户端是否支持 PyroWave 由配套版本和运行能力决定。
+
+原生 API 使用基于上游 1.0.0 的 101.0.0，保留颜色读取/设置和 HLG 扩展。
+Sunshine 保持默认 context 0 的同步交付，不因上游提供异步批处理接口而改变串流节奏。
+原生 ABI、文件封装和网络 Frame Envelope 分别管理，不能以某一版本号代替其他合同的校验。
 
 颜色范围只影响 YUV 信号的量化范围，不改变上述位深合同。PyroWave GPU 编解码路径会在
 对应的 SDR 8-bit 或 HDR 10-bit shader 中完成 limited/full 归一化。
@@ -45,8 +49,8 @@ PyroWave 传输合同直接冻结为 `PYRF` Frame Envelope（当前字段值为
 - 主机耗时通过可选 Runtime TLV 传递，丢失时不影响视频；
 - `SS_HDR_METADATA` 仍走现有控制通道，不复制到 PyroWave color metadata。
 
-PyroWave 尚未发布过旧 wire，因此这里不是迁移或多版本兼容实现：不保留旧实验格式解析分支，
-Sunshine 与配套 Moonlight V+ 只实现这一份合同。没有声明 PyroWave 能力的客户端仍按传统编码格式协商。
+Sunshine 与配套 Moonlight V+ 共享这一份合同，不保留早期实验包格式的解析分支。
+没有声明 PyroWave 能力的客户端仍按传统编码格式协商。
 
 ### 共享视频管线
 
@@ -56,8 +60,9 @@ PyroWave 只替换视频编码和解码后端，继续使用 Sunshine 现有的�
 
 客户端和服务端需要同时确认固定合同字段、能力、颜色范围和 HDR 类型。limited/full range
 都属于正式的 PyroWave 颜色合同，客户端的现有颜色范围设置会原样参与协商，不会被强制改成
-full range。未选择 PyroWave 的客户端继续保留传统编码格式；显式选择 PyroWave 时，
-协商或预检失败应明确结束本次连接，不在当前连接中静默切换到 HEVC/AV1。
+full range。未选择 PyroWave 的客户端继续保留传统编码格式。初始能力协商未选中 PyroWave
+时，可沿用 common-c 的 H.264 兼容兜底，并由客户端提示实际格式；预检失败、ANNOUNCE
+拒绝或已建立会话中的故障不因此新增自动 codec 重试，也不静默切换到 HEVC/AV1。
 
 ### HDR 分层
 
@@ -66,7 +71,29 @@ full range。未选择 PyroWave 的客户端继续保留传统编码格式；显
 - SDR、HDR10/PQ 和 HLG 通过明确的颜色合同协商；
 - Sunshine 的静态 HDR 呈现信息通过现有控制通道传递；
 - HLG 不伪造 HDR10 mastering metadata；
-- 动态 HDR10+、HDR Vivid 和 Dolby Vision 不属于当前范围。
+- PyroWave 在原生 Vulkan Vivid 能力可用时按帧提交 Vivid PQ/HLG 动态 metadata；HDR10+ 与
+  Dolby Vision 8.1/8.4 由客户端应用映射到各自协商的 PQ/HLG 基础信号。应用映射不代表
+  Dolby 或 HDR10+ 的厂商认证输出。
+
+### 动态 HDR 帧交付
+
+动态会话在客户端现有 HDR 选项中选择；PyroWave 的动态选项包括原生 Vivid 以及
+HDR10+/Dolby Vision 应用映射。主机需要开启 HDR 亮度分析，客户端在连接前验证对应
+Vulkan Surface、静态 HDR metadata 和动态映射能力。双方确认动态格式及能力后才进入媒体阶段。
+
+原生 Vivid、HDR10+ 和 Dolby Vision metadata 使用 Sunshine 现有的异步亮度分析和会话内场景快照；
+客户端按协商格式分别执行原生 Vivid 提交或应用映射。
+无新样本或新统计无效时保留有效状态，不因此丢帧；编码器重建时清空场景历史。
+
+完整动态 HDR payload 与该帧码流一起参与 FEC，重组后随 decode unit 传到 Vulkan 原生或应用映射阶段。
+主机复用场景统计不等于省略逐帧 metadata：接收端仍拒绝缺失或非法的必需 TLV，不能用
+客户端上一帧的 metadata 补齐。没有有效状态时不生成默认动态 metadata。
+
+PyroWave 原生 Vivid 只接受 Sunshine 生成的四项统计和 UWA base curve 子集，
+Vivid/PQ 使用 `system_start_code=0x01`，Vivid/HLG 使用 `0x02`。metadata 正文在实际
+Vulkan device 启用 Vivid feature 后通过原生接口提交，不在客户端生成 Vivid 亮度 LUT。
+HDR10+ 的 ST 2094-40 单窗口曲线和 Dolby Vision 8.1/8.4 的受支持 RPU 字段由客户端应用映射；
+Dolby Profile 5/7、NLQ、增强层和影片 authored metadata 仍由传统 HEVC 路径负责。
 
 ### 失败隔离
 
@@ -80,7 +107,7 @@ full range。未选择 PyroWave 的客户端继续保留传统编码格式；显
 
 - 默认启用 PyroWave；
 - Linux 服务端和其他客户端平台；
-- 动态 HDR10+ 的生产和 Vulkan 呈现（Frame Envelope TLV 已预留，当前仍不启用）；
+- 厂商原生 HDR10+/Dolby 输出、原生 Vivid 的设备全覆盖、任意影片动态曲线、Dolby Profile 5/7 和增强层；
 - 4K、4:4:4、4:2:2 和高帧率全覆盖；
 - 混合 GPU、多 GPU、多客户端和所有 VDD 场景；
 - 固定带宽、固定丢包率或固定延迟保证；
