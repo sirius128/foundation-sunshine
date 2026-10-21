@@ -336,7 +336,10 @@ namespace audio {
       12,
       0,
       platf::speaker::map_surround714,
-      3072000,
+      // Not 256 Kbps per channel like the other high quality layouts: that
+      // would need 1920 bytes per 5 ms packet, more than the encoder's
+      // 1400 byte buffer, so the last streams would be starved of bits
+      2048000,
     },
   };
 
